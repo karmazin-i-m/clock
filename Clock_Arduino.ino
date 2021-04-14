@@ -1,14 +1,7 @@
 #include <DS3231.h>
 #include <Adafruit_Sensor.h>
-#include <Adafruit_BMP280.h>
+#include <Adafruit_BME280.h>
 #include <Wire.h>
-
-//#define InterruptPin 2
-//#define LatchPin 3
-//#define ClockPin 4
-//#define AnodeDataPin 5
-//#define CatodeDataPin 6
-//#define CatodeClockPin 7
 
 #define InterruptPin 2
 #define LatchPin 4
@@ -20,7 +13,8 @@
 const int times = 0;
 const int temperature = 1;
 const int pressure = 2;
-const int altitude = 3;
+const int humidity = 3;
+const int altitude = 4;
 const int settings = 100;
 const int minuteMinorSettings = 101;
 const int minuteMajorSettings = 102;
@@ -33,6 +27,7 @@ const int degree = 11;
 const int celsius = 12;
 const int pressureSymbol= 13;
 const int nullNumber = 14;
+const int percent = 15;
 
 void visual();
 void timeArrayFilling(int hour1 = nullNumber, int hour2 = nullNumber, int minute1 = nullNumber, int minute2 = nullNumber);
@@ -43,7 +38,7 @@ void changeState();
 void lowInterrupt();
 
 DS3231 clk;
-Adafruit_BMP280 bme;
+Adafruit_BME280 bme;
 RTCDateTime dt;
 
 void setup() {
@@ -56,8 +51,9 @@ void setup() {
   
   clk.begin();
   //clk.setDateTime(__DATE__, __TIME__);
-  
-  bme.begin();
+
+  unsigned status;
+  status = bme.begin(0x76);
   
   attachInterrupt(0, changeState, CHANGE);
   
@@ -85,6 +81,7 @@ int numeric[][8] = {
   {0x00,0x07,0x04,0x04,0x04,0x04,0x07,0x00},                  //c
   {0x0F,0x09,0x09,0x0F,0x08,0x08,0x08,0x00},                  //p
   {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},                  //null
+  {0x71,0x52,0x74,0x08,0x17,0x25,0x47,0x00},                  //%
 };
 
 volatile long debounceInterrupt;
@@ -125,13 +122,23 @@ void loop() {
     break;
     case pressure:
     {
-      int pressure = int((bme.readPressure()/133.0));
+      int pressure = int((bme.readPressure()/133.0F));
       
       int pressure1 = pressure / 100;
       int pressure2 = pressure % 100 / 10;
       int pressure3 = pressure % 10;
       
       pressureArrayFiling(pressure1, pressure2, pressure3);
+    }
+    break;
+    case humidity:
+    {
+      int humidity = int(bme.readHumidity());
+      
+      int humidity_minore = humidity % 10;
+      int humidity_major = humidity / 10;
+      
+      humidityArrayFiling(humidity_major, humidity_minore);
     }
     break;
     case settings:
@@ -263,6 +270,15 @@ void pressureArrayFiling(int pressure1, int pressure2, int pressure3){
     out[i][0] = (numeric[pressureSymbol][i]<<1) + (numeric[pressure3][i]<<6);
     out[i][1] = (numeric[pressure2][i]<<3) + (numeric[pressure3][i]>>2);
     out[i][2] = numeric[pressure1][i];
+  }
+}
+
+void humidityArrayFiling(int humidity1, int humidity2){
+  for (int i = 0; i<8 ; i++)
+  {
+    out[i][0] = (numeric[percent][i]<<1); //+ (numeric[humidity1][i]<<5);
+    out[i][1] = (numeric[humidity1][i]<<6) + (numeric[humidity2][i]<<1);
+    out[i][2] = (numeric[humidity1][i]>>2);
   }
 }
 
