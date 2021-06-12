@@ -288,6 +288,7 @@ int concatenateInt(int major, int minor){
 
 void changeState(){
   bool pinState = digitalRead(2);
+  Serial.println(pinState);
   
   if(pinState){
     debounceInterrupt = millis();
@@ -308,7 +309,7 @@ void changeState(){
     lockInterrupt = false;
   }
   
-  if (debounceInterrupt >= 70 && debounceInterrupt <= 150 && !pinState && lockInterrupt) {
+  if (debounceInterrupt >= 1 && debounceInterrupt <= 300 &&!pinState && lockInterrupt) {
     
     if(state < settings)
     {
