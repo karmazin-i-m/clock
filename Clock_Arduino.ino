@@ -16,7 +16,7 @@
 #include <Wire.h>
 #include <avr/pgmspace.h>
 
-#define InterruptPin 2
+#define ButtonPin 2
 #define LatchPin 4
 #define ClockPin 3
 #define AnodeDataPin 5
@@ -56,6 +56,20 @@
 #define PRESSURE_SAMPLE_MS 900000UL
 #define PRESSURE_TREND_MMHG 1
 
+// One click steps through the screens. Holding does something only on the clock
+// screen, where it opens time programming; once inside, a hold moves to the next
+// field, which is deliberately shorter - four fields at three seconds each would
+// be twelve seconds of holding to set a time.
+#define BUTTON_DEBOUNCE_MS 25
+#define BUTTON_HOLD_MS 3000
+#define BUTTON_FIELD_HOLD_MS 1000
+
+#if HAS_HUMIDITY
+#define DISPLAY_MODE_COUNT 4
+#else
+#define DISPLAY_MODE_COUNT 3
+#endif
+
 const int times = 0;
 const int temperature = 1;
 const int pressure = 2;
@@ -86,7 +100,9 @@ void timeArrayFilling(int hour1 = nullNumber, int hour2 = nullNumber, int minute
 void pressureArrayFiling(int pressure1, int pressure2, int pressure3, int trend = nullNumber);
 void temperatureArrayFiling(int temperature1, int temperature2);
 int concatenateInt(int major, int minor);
-void changeState();
+void updateButton(unsigned long now);
+void buttonClick();
+void buttonHold();
 void readSensors();
 void recordPressureSample();
 int pressureTrendGlyph();
@@ -126,15 +142,13 @@ void setup() {
   pinMode(AnodeDataPin, OUTPUT);
   pinMode(CatodeClockPin, OUTPUT);
   pinMode(CatodeDataPin, OUTPUT);
-  pinMode(InterruptPin, INPUT_PULLUP);
+  pinMode(ButtonPin, INPUT_PULLUP);
   
   clk.begin();
   //clk.setDateTime(__DATE__, __TIME__);
 
   unsigned status;
   status = bme.begin(0x76);
-  
-  attachInterrupt(0, changeState, CHANGE);
   
   Serial.begin(9600);
   Serial.println("Initialized");
@@ -175,9 +189,14 @@ static inline uint8_t glyph(int index, int row){
   return pgm_read_byte(&numeric[index][row]);
 }
 
-volatile long debounceInterrupt;
 long blinkTimeSettings;
-volatile int  state = 0;
+int state = 0;
+
+bool buttonRaw;
+bool buttonStable;
+bool buttonHoldFired;
+unsigned long buttonEdgeTime;
+unsigned long buttonPressTime;
 
 int minute_minore;
 int minute_major;
@@ -192,6 +211,8 @@ int lastMarqueeMinute = -1;
 
 void loop() {
   unsigned long now = millis();
+  
+  updateButton(now);
   
   // The sensor moves far slower than the display refreshes, and reading it in
   // every pass was the main reason the sensor screens looked dimmer than the
@@ -574,68 +595,96 @@ int concatenateInt(int major, int minor){
   return (major*10) + minor;
 }
 
-void changeState(){
-  bool pinState = digitalRead(InterruptPin);
+// Polled rather than interrupt driven. loop() now runs on a fixed ~4 ms cadence,
+// which is ample for a button, and it keeps press timing out of an ISR entirely.
+// The old handler classified the gap since the previous release rather than how
+// long the button was held, and had no debounce, so contact bounce alone stepped
+// through the screens.
+void updateButton(unsigned long now){
+  bool pressed = (digitalRead(ButtonPin) == LOW);
   
-  if(pinState){
-    debounceInterrupt = millis();
+  if(pressed != buttonRaw){
+    buttonRaw = pressed;
+    buttonEdgeTime = now;
   }
-  else{
-    debounceInterrupt = millis() - debounceInterrupt;
-  }
-  
-  if (debounceInterrupt >= 1000 && debounceInterrupt <= 3000 && !pinState) {
+  else if(pressed != buttonStable && now - buttonEdgeTime >= BUTTON_DEBOUNCE_MS){
+    buttonStable = pressed;
     
-    if(state < settings)
-    {
-      state = settings;
+    if(pressed){
+      buttonPressTime = now;
+      buttonHoldFired = false;
     }
-    else{
-      state ++;
+    else if(!buttonHoldFired){
+      buttonClick();
     }
   }
   
-  if (debounceInterrupt >= 1 && debounceInterrupt <= 300 &&!pinState) {
+  // A hold that lands on a screen which ignores it still suppresses the click,
+  // so holding never quietly turns into a page step on release.
+  if(buttonStable && !buttonHoldFired){
+    unsigned long threshold = (state >= settings) ? BUTTON_FIELD_HOLD_MS : BUTTON_HOLD_MS;
     
-    if(state < settings)
-    {
-      state++;
+    if(now - buttonPressTime >= threshold){
+      buttonHoldFired = true;
+      buttonHold();
     }
-    else{
-      switch(state){
-        case minuteMinorSettings:
-        {
-          minute_minore ++;
-          if(minute_minore == 10){
-            minute_minore = 0;
-          }
+  }
+}
+
+void buttonClick(){
+  if(state >= settings){
+    switch(state){
+      case minuteMinorSettings:
+      {
+        minute_minore ++;
+        if(minute_minore == 10){
+          minute_minore = 0;
         }
-        break;
-        case minuteMajorSettings:
-        {
-          minute_major++;
-          if(minute_major == 6){
-            minute_major = 0;
-          }
-        }
-        break;
-        case hourMinorSettings:
-        {
-          hour_minore++;
-          if(hour_minore == 10){
-            hour_minore = 0;
-          }
-        }
-        break;
-        case hourMajorSettings:
-        {
-          hour_major++;
-          if(hour_major == 3){
-            hour_major = 0;
-          }
-        }
-        break;
       }
+      break;
+      case minuteMajorSettings:
+      {
+        minute_major++;
+        if(minute_major == 6){
+          minute_major = 0;
+        }
+      }
+      break;
+      case hourMinorSettings:
+      {
+        hour_minore++;
+        if(hour_minore == 10){
+          hour_minore = 0;
+        }
+      }
+      break;
+      case hourMajorSettings:
+      {
+        hour_major++;
+        if(hour_major == 3){
+          hour_major = 0;
+        }
+      }
+      break;
     }
+    return;
+  }
+  
+  // Steps the screens, and doubles as the way out of a running marquee.
+  state++;
+  
+  if(state >= DISPLAY_MODE_COUNT){
+    state = times;
+  }
+}
+
+void buttonHold(){
+  if(state == times){
+    state = settings;
+    return;
+  }
+  
+  if(state >= settings){
+    state++;
   }
 }
