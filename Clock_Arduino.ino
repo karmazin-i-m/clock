@@ -10,11 +10,23 @@
 #define CatodeDataPin 7
 #define CatodeClockPin 6
 
+#define RENDER_LINE_COUNT 8
+
+#define MARQUEE_PAGE_COUNT 5
+#define MARQUEE_PAGE_BYTES 3
+#define MARQUEE_STRIP_BYTES (MARQUEE_PAGE_COUNT * MARQUEE_PAGE_BYTES)
+#define MARQUEE_PAGE_COLUMNS 24
+#define MARQUEE_TOTAL_STEPS ((MARQUEE_PAGE_COUNT - 1) * MARQUEE_PAGE_COLUMNS)
+#define MARQUEE_STEP_MS 80
+#define MARQUEE_HOLD_MS 5000
+#define MARQUEE_PERIOD_MINUTES 5
+
 const int times = 0;
 const int temperature = 1;
 const int pressure = 2;
 const int humidity = 3;
 const int altitude = 4;
+const int marquee = 5;
 const int settings = 100;
 const int minuteMinorSettings = 101;
 const int minuteMajorSettings = 102;
@@ -36,6 +48,10 @@ void temperatureArrayFiling(int temperature1, int temperature2);
 int concatenateInt(int major, int minor);
 void changeState();
 void lowInterrupt();
+void humidityArrayFiling(int humidity1, int humidity2);
+void startMarquee();
+void marqueeCapturePage(int page);
+void marqueeRender();
 
 DS3231 clk;
 Adafruit_BME280 bme;
@@ -95,12 +111,25 @@ int minute_major;
 int hour_minore;
 int hour_major;
 
+uint8_t marqueeStrip[8][MARQUEE_STRIP_BYTES];
+int marqueeStep;
+unsigned long marqueeStepTime;
+int lastMarqueeMinute = -1;
+
 void loop() {
+  //Serial.println(state); 
+  if(state < settings && state != marquee){
+    dt = clk.getDateTime();
+    
+    if(dt.minute % MARQUEE_PERIOD_MINUTES == 0 && dt.minute != lastMarqueeMinute){
+      lastMarqueeMinute = dt.minute;
+      startMarquee();
+    }
+  }
+  
   switch(state){
     case times:
     {
-      dt = clk.getDateTime();
-      
       minute_minore = dt.minute % 10;
       minute_major = dt.minute / 10;
       
@@ -139,6 +168,31 @@ void loop() {
       int humidity_major = humidity / 10;
       
       humidityArrayFiling(humidity_major, humidity_minore);
+      //humidityArrayFiling(0, 0);
+    }
+    break;
+    case marquee:
+    {
+      // The last page is the clock again, so hand straight back to `times` on arrival
+      // instead of dwelling on a copy of the time captured half a minute ago.
+      if(marqueeStep >= MARQUEE_TOTAL_STEPS){
+        state = times;
+        break;
+      }
+      
+      // A step that has just brought a whole screen into view dwells before moving on.
+      unsigned long interval = MARQUEE_STEP_MS;
+      
+      if(marqueeStep > 0 && marqueeStep % MARQUEE_PAGE_COLUMNS == 0){
+        interval = MARQUEE_HOLD_MS;
+      }
+      
+      if(millis() - marqueeStepTime >= interval){
+        marqueeStepTime = millis();
+        marqueeStep++;
+      }
+      
+      marqueeRender();
     }
     break;
     case settings:
@@ -279,6 +333,68 @@ void humidityArrayFiling(int humidity1, int humidity2){
     out[i][0] = (numeric[percent][i]<<1); //+ (numeric[humidity1][i]<<5);
     out[i][1] = (numeric[humidity1][i]<<6) + (numeric[humidity2][i]<<1);
     out[i][2] = (numeric[humidity1][i]>>2);
+  }
+}
+
+void startMarquee(){
+  int hour1 = dt.hour / 10;
+  int hour2 = dt.hour % 10;
+  int minute1 = dt.minute / 10;
+  int minute2 = dt.minute % 10;
+  
+  timeArrayFilling(hour1, hour2, minute1, minute2);
+  marqueeCapturePage(0);
+  
+  int temperatureNow = int(bme.readTemperature());
+  temperatureArrayFiling(temperatureNow / 10, temperatureNow % 10);
+  marqueeCapturePage(1);
+  
+  int pressureNow = int((bme.readPressure()/133.0F));
+  pressureArrayFiling(pressureNow / 100, pressureNow % 100 / 10, pressureNow % 10);
+  marqueeCapturePage(2);
+  
+  int humidityNow = int(bme.readHumidity());
+  humidityArrayFiling(humidityNow / 10, humidityNow % 10);
+  marqueeCapturePage(3);
+  
+  timeArrayFilling(hour1, hour2, minute1, minute2);
+  marqueeCapturePage(4);
+  
+  marqueeStep = 0;
+  marqueeStepTime = millis();
+  state = marquee;
+}
+
+// Page 0 is shown first, so it sits at the high (left) end of the strip.
+void marqueeCapturePage(int page){
+  int base = MARQUEE_PAGE_BYTES * (MARQUEE_PAGE_COUNT - 1 - page);
+  
+  for (int i = 0; i<8 ; i++)
+  {
+    marqueeStrip[i][base + 0] = out[i][0];
+    marqueeStrip[i][base + 1] = out[i][1];
+    marqueeStrip[i][base + 2] = out[i][2];
+  }
+}
+
+// Copy the visible 24 column window out of the strip, one column further right each step.
+void marqueeRender(){
+  int shift = MARQUEE_TOTAL_STEPS - marqueeStep;
+  int byteIndex = shift / 8;
+  int bitOffset = shift % 8;
+  
+  for (int i = 0; i<8 ; i++)
+  {
+    for (int b = 0; b<MARQUEE_PAGE_BYTES ; b++)
+    {
+      int value = marqueeStrip[i][byteIndex + b] >> bitOffset;
+      
+      if(bitOffset){
+        value |= marqueeStrip[i][byteIndex + b + 1] << (8 - bitOffset);
+      }
+      
+      out[i][b] = value & 0xFF;
+    }
   }
 }
 
