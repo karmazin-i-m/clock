@@ -64,6 +64,12 @@
 #define BUTTON_HOLD_MS 3000
 #define BUTTON_FIELD_HOLD_MS 1000
 
+// Any screen other than the clock returns to it once the button has been left
+// alone this long. Programming is included on purpose - otherwise walking away
+// mid-edit leaves the clock in a blinking settings screen for good. Leaving that
+// way writes nothing to the RTC, so the edit is simply dropped.
+#define IDLE_RETURN_MS 30000
+
 #if HAS_HUMIDITY
 #define DISPLAY_MODE_COUNT 4
 #else
@@ -197,6 +203,7 @@ bool buttonStable;
 bool buttonHoldFired;
 unsigned long buttonEdgeTime;
 unsigned long buttonPressTime;
+unsigned long buttonActivityTime;
 
 int minute_minore;
 int minute_major;
@@ -213,6 +220,12 @@ void loop() {
   unsigned long now = millis();
   
   updateButton(now);
+  
+  // The marquee is left alone: it runs on its own clock and already ends on the
+  // clock screen, so timing it out would only truncate it.
+  if(state != times && state != marquee && now - buttonActivityTime >= IDLE_RETURN_MS){
+    state = times;
+  }
   
   // The sensor moves far slower than the display refreshes, and reading it in
   // every pass was the main reason the sensor screens looked dimmer than the
@@ -609,6 +622,7 @@ void updateButton(unsigned long now){
   }
   else if(pressed != buttonStable && now - buttonEdgeTime >= BUTTON_DEBOUNCE_MS){
     buttonStable = pressed;
+    buttonActivityTime = now;
     
     if(pressed){
       buttonPressTime = now;
