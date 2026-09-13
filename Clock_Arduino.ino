@@ -57,17 +57,14 @@
 #define PRESSURE_TREND_MMHG 1
 
 // One click steps through the screens. Holding does something only on the clock
-// screen, where it opens time programming; once inside, a hold moves to the next
-// field, which is deliberately shorter - four fields at three seconds each would
-// be twelve seconds of holding to set a time.
+// screen, where it opens time programming, and inside programming, where it moves
+// to the next field. The same three seconds either way.
 #define BUTTON_DEBOUNCE_MS 25
 #define BUTTON_HOLD_MS 3000
-#define BUTTON_FIELD_HOLD_MS 1000
 
-// Any screen other than the clock returns to it once the button has been left
-// alone this long. Programming is included on purpose - otherwise walking away
-// mid-edit leaves the clock in a blinking settings screen for good. Leaving that
-// way writes nothing to the RTC, so the edit is simply dropped.
+// A sensor screen returns to the clock once the button has been left alone this
+// long. Programming is exempt: it is a deliberate mode the user is standing in
+// front of, and dropping out of it mid-edit would be worse than waiting.
 #define IDLE_RETURN_MS 30000
 
 #if HAS_HUMIDITY
@@ -221,9 +218,9 @@ void loop() {
   
   updateButton(now);
   
-  // The marquee is left alone: it runs on its own clock and already ends on the
-  // clock screen, so timing it out would only truncate it.
-  if(state != times && state != marquee && now - buttonActivityTime >= IDLE_RETURN_MS){
+  // The marquee is left alone as well: it runs on its own clock and already ends
+  // on the clock screen, so timing it out would only truncate it.
+  if(state > times && state < settings && state != marquee && now - buttonActivityTime >= IDLE_RETURN_MS){
     state = times;
   }
   
@@ -636,9 +633,7 @@ void updateButton(unsigned long now){
   // A hold that lands on a screen which ignores it still suppresses the click,
   // so holding never quietly turns into a page step on release.
   if(buttonStable && !buttonHoldFired){
-    unsigned long threshold = (state >= settings) ? BUTTON_FIELD_HOLD_MS : BUTTON_HOLD_MS;
-    
-    if(now - buttonPressTime >= threshold){
+    if(now - buttonPressTime >= BUTTON_HOLD_MS){
       buttonHoldFired = true;
       buttonHold();
     }
