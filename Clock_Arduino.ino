@@ -58,7 +58,9 @@
 
 // One click steps through the screens. Holding does something only on the clock
 // screen, where it opens time programming, and inside programming, where it moves
-// to the next field. The same three seconds either way.
+// to the next field. Entering takes the full three seconds so it cannot happen by
+// accident; once inside, a second is enough and keeps setting a time bearable.
+//
 // The button is wired active HIGH. D2 was measured idling LOW in 100% of samples
 // with the internal pull-up enabled and nothing pressed, and with zero edges, so
 // an external pull-down holds the line and pressing lifts it. Reading it the other
@@ -67,6 +69,7 @@
 
 #define BUTTON_DEBOUNCE_MS 25
 #define BUTTON_HOLD_MS 3000
+#define BUTTON_FIELD_HOLD_MS 1000
 
 // A sensor screen returns to the clock once the button has been left alone this
 // long. Programming is exempt: it is a deliberate mode the user is standing in
@@ -639,7 +642,9 @@ void updateButton(unsigned long now){
   // A hold that lands on a screen which ignores it still suppresses the click,
   // so holding never quietly turns into a page step on release.
   if(buttonStable && !buttonHoldFired){
-    if(now - buttonPressTime >= BUTTON_HOLD_MS){
+    unsigned long threshold = (state >= settings) ? BUTTON_FIELD_HOLD_MS : BUTTON_HOLD_MS;
+    
+    if(now - buttonPressTime >= threshold){
       buttonHoldFired = true;
       buttonHold();
     }
