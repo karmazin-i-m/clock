@@ -1,0 +1,40 @@
+# --- AutoCAD -----------------------------------------------------------------
+# Every .dwg is shadowed by a .bak of its previous save, and .dwl/.dwl2 are the
+# lock files AutoCAD writes while a drawing is open.
+*.bak
+*.dwl
+*.dwl2
+*.sv$
+*.ac$
+*.err
+plot.log
+
+# --- Proteus -----------------------------------------------------------------
+# .pdsbak are the "Backup Of" / "Last Loaded" copies; the workspace file is per
+# user and carries the machine name.
+*.pdsbak
+*.pdsprj.*.workspace
+
+# --- Arduino / Atmel build output --------------------------------------------
+build/
+Debug/
+Release/
+*.o
+*.d
+*.a
+*.elf
+*.hex
+*.eep
+*.lss
+*.map
+.vs/
+*.atsuo
+
+# --- Editors and OS ----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
