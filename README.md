@@ -117,3 +117,7 @@ the marquee window and the trend arrow placement were checked before flashing.
 
 `CLAUDE.md` documents the internals: the frame buffer layout, the glyph table, the state
 machine and the traps worth knowing about.
+
+## License
+
+MIT — see `LICENSE`.
