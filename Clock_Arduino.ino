@@ -14,6 +14,7 @@
 #include <Adafruit_BMP280.h>
 #endif
 #include <Wire.h>
+#include <avr/pgmspace.h>
 
 #define InterruptPin 2
 #define LatchPin 4
@@ -37,6 +38,24 @@
 #define MARQUEE_HOLD_MS 5000
 #define MARQUEE_PERIOD_MINUTES 5
 
+// Every row gets the same slot and is blanked at the end of it, so brightness
+// stops depending on how long loop() happened to take. Dimming is simply a
+// shorter lit fraction of that same slot, which leaves the frame rate alone.
+#define ROW_PERIOD_US 500
+#define ROW_ON_BRIGHT_US 450
+#define ROW_ON_DIM_US 60
+#define DIM_FROM_HOUR 22
+#define DIM_UNTIL_HOUR 7
+
+#define CLOCK_POLL_MS 100
+#define SENSOR_POLL_MS 1000
+
+// Twelve samples a quarter of an hour apart give the three hour window that
+// pressure trends are conventionally read over.
+#define PRESSURE_HISTORY 12
+#define PRESSURE_SAMPLE_MS 900000UL
+#define PRESSURE_TREND_MMHG 1
+
 const int times = 0;
 const int temperature = 1;
 const int pressure = 2;
@@ -58,14 +77,19 @@ const int celsius = 12;
 const int pressureSymbol= 13;
 const int nullNumber = 14;
 const int percent = 15;
+const int trendUp = 16;
+const int trendDown = 17;
+const int trendSteady = 18;
 
 void visual();
-void timeArrayFilling(int hour1 = nullNumber, int hour2 = nullNumber, int minute1 = nullNumber, int minute2 = nullNumber);
-void pressureArrayFiling(int pressure1, int pressure2, int pressure3);
+void timeArrayFilling(int hour1 = nullNumber, int hour2 = nullNumber, int minute1 = nullNumber, int minute2 = nullNumber, int separator = colon);
+void pressureArrayFiling(int pressure1, int pressure2, int pressure3, int trend = nullNumber);
 void temperatureArrayFiling(int temperature1, int temperature2);
 int concatenateInt(int major, int minor);
 void changeState();
-void lowInterrupt();
+void readSensors();
+void recordPressureSample();
+int pressureTrendGlyph();
 #if HAS_HUMIDITY
 void humidityArrayFiling(int humidity1, int humidity2);
 #endif
@@ -80,6 +104,21 @@ Adafruit_BME280 bme;
 Adafruit_BMP280 bme;
 #endif
 RTCDateTime dt;
+
+uint16_t rowOnMicros = ROW_ON_BRIGHT_US;
+
+float sensorTemperature;
+float sensorPressure;
+#if HAS_HUMIDITY
+float sensorHumidity;
+#endif
+unsigned long sensorReadTime;
+unsigned long clockReadTime;
+
+int pressureHistory[PRESSURE_HISTORY];
+uint8_t pressureHistoryCount;
+uint8_t pressureHistoryHead;
+unsigned long pressureSampleTime;
 
 void setup() {
   pinMode(LatchPin, OUTPUT);
@@ -99,13 +138,18 @@ void setup() {
   
   Serial.begin(9600);
   Serial.println("Initialized");
+  
+  readSensors();
+  recordPressureSample();
+  sensorReadTime = millis();
+  pressureSampleTime = millis();
 }
 
-int catode[] = {2, 4, 8, 16, 32, 64, 128, 1};
+const uint8_t catode[8] PROGMEM = {2, 4, 8, 16, 32, 64, 128, 1};
 
-int out[8][3] = {};
+uint8_t out[8][3] = {};
 
-int numeric[][8] = {
+const uint8_t numeric[][8] PROGMEM = {
   {0x0F,0x09,0x09,0x09,0x09,0x09,0x0F,0x00},                  //0
   {0x02,0x06,0x0A,0x02,0x02,0x02,0x0F,0x00},                  //1
   {0x0F,0x01,0x01,0x0F,0x08,0x08,0x0F,0x00},                  //2
@@ -122,11 +166,17 @@ int numeric[][8] = {
   {0x0F,0x09,0x09,0x0F,0x08,0x08,0x08,0x00},                  //p
   {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},                  //null
   {0x71,0x52,0x74,0x08,0x17,0x25,0x47,0x00},                  //%
+  {0x02,0x07,0x02,0x02,0x02,0x02,0x02,0x00},                  //trend up
+  {0x02,0x02,0x02,0x02,0x02,0x07,0x02,0x00},                  //trend down
+  {0x00,0x00,0x00,0x07,0x00,0x00,0x00,0x00},                  //trend steady
 };
+
+static inline uint8_t glyph(int index, int row){
+  return pgm_read_byte(&numeric[index][row]);
+}
 
 volatile long debounceInterrupt;
 long blinkTimeSettings;
-volatile bool lockInterrupt = true;
 volatile int  state = 0;
 
 int minute_minore;
@@ -141,9 +191,25 @@ unsigned long marqueeStepTime;
 int lastMarqueeMinute = -1;
 
 void loop() {
-  //Serial.println(state); 
-  if(state < settings && state != marquee){
+  unsigned long now = millis();
+  
+  // The sensor moves far slower than the display refreshes, and reading it in
+  // every pass was the main reason the sensor screens looked dimmer than the
+  // clock. Once a second is more than the readings are worth.
+  if(now - sensorReadTime >= SENSOR_POLL_MS){
+    sensorReadTime = now;
+    readSensors();
+  }
+  
+  if(now - pressureSampleTime >= PRESSURE_SAMPLE_MS){
+    pressureSampleTime = now;
+    recordPressureSample();
+  }
+  
+  if(state < settings && state != marquee && now - clockReadTime >= CLOCK_POLL_MS){
+    clockReadTime = now;
     dt = clk.getDateTime();
+    rowOnMicros = (dt.hour >= DIM_FROM_HOUR || dt.hour < DIM_UNTIL_HOUR) ? ROW_ON_DIM_US : ROW_ON_BRIGHT_US;
     
     if(dt.minute % MARQUEE_PERIOD_MINUTES == 0 && dt.minute != lastMarqueeMinute){
       lastMarqueeMinute = dt.minute;
@@ -160,12 +226,13 @@ void loop() {
       hour_minore = dt.hour % 10;
       hour_major = dt.hour / 10;
       
-      timeArrayFilling(hour_major,hour_minore,minute_major,minute_minore);
+      timeArrayFilling(hour_major,hour_minore,minute_major,minute_minore,
+                       (dt.second & 1) ? colon : nullNumber);
     }
     break;
     case temperature:
     {
-      int temperature = int(bme.readTemperature());
+      int temperature = int(sensorTemperature);
       
       int temperature_minore = temperature % 10;
       int temperature_major = temperature / 10;
@@ -175,19 +242,19 @@ void loop() {
     break;
     case pressure:
     {
-      int pressure = int((bme.readPressure()/133.0F));
+      int pressure = int(sensorPressure);
       
       int pressure1 = pressure / 100;
       int pressure2 = pressure % 100 / 10;
       int pressure3 = pressure % 10;
       
-      pressureArrayFiling(pressure1, pressure2, pressure3);
+      pressureArrayFiling(pressure1, pressure2, pressure3, pressureTrendGlyph());
     }
     break;
 #if HAS_HUMIDITY
     case humidity:
     {
-      int humidity = int(bme.readHumidity());
+      int humidity = int(sensorHumidity);
       
       int humidity_minore = humidity % 10;
       int humidity_major = humidity / 10;
@@ -314,41 +381,79 @@ void loop() {
   visual();
 }
 
-void visual(){
-  for(int i=0;i<8;i++){
-    digitalWrite(LatchPin, LOW);
-    shiftOut(CatodeDataPin,CatodeClockPin,LSBFIRST, out[i][0]);
-    shiftOut(CatodeDataPin,CatodeClockPin,LSBFIRST, out[i][1]);
-    shiftOut(CatodeDataPin,CatodeClockPin,LSBFIRST, out[i][2]);
-    shiftOut(AnodeDataPin,ClockPin, MSBFIRST, catode[i]);
-    digitalWrite(LatchPin, HIGH);
+// All five display pins sit on PORTD, so the registers can be clocked with
+// single cycle sbi/cbi instead of digitalWrite. Only our own bits are touched,
+// which leaves the serial pins and the button pull-up on PD2 alone.
+#define LATCH_BIT   (1 << LatchPin)
+#define CLOCK_BIT   (1 << ClockPin)
+#define ANODE_BIT   (1 << AnodeDataPin)
+#define CAT_CLK_BIT (1 << CatodeClockPin)
+#define CAT_DAT_BIT (1 << CatodeDataPin)
+
+static void shiftCatode(uint8_t value){
+  for(uint8_t bit = 0; bit < 8; bit++){
+    if(value & 1){ PORTD |= CAT_DAT_BIT; } else { PORTD &= ~CAT_DAT_BIT; }
+    PORTD |= CAT_CLK_BIT;
+    PORTD &= ~CAT_CLK_BIT;
+    value >>= 1;
   }
 }
 
-void timeArrayFilling(int hour1, int hour2, int minute1, int minute2){
+static void shiftAnode(uint8_t value){
+  for(uint8_t bit = 0; bit < 8; bit++){
+    if(value & 0x80){ PORTD |= ANODE_BIT; } else { PORTD &= ~ANODE_BIT; }
+    PORTD |= CLOCK_BIT;
+    PORTD &= ~CLOCK_BIT;
+    value <<= 1;
+  }
+}
+
+static void latchRow(uint8_t byte0, uint8_t byte1, uint8_t byte2, uint8_t row){
+  PORTD &= ~LATCH_BIT;
+  shiftCatode(byte0);
+  shiftCatode(byte1);
+  shiftCatode(byte2);
+  shiftAnode(row);
+  PORTD |= LATCH_BIT;
+}
+
+// A row used to stay lit until the next one was latched, so the last row of a
+// frame also burned through everything loop() did afterwards - the bottom line
+// was brighter, and by an amount that varied with the screen being shown. Now
+// every row gets an identical slot and is blanked at the end of it.
+void visual(){
+  for(uint8_t i = 0; i < 8; i++){
+    latchRow(out[i][0], out[i][1], out[i][2], pgm_read_byte(&catode[i]));
+    delayMicroseconds(rowOnMicros);
+    latchRow(0, 0, 0, 0);
+    delayMicroseconds(ROW_PERIOD_US - rowOnMicros);
+  }
+}
+
+void timeArrayFilling(int hour1, int hour2, int minute1, int minute2, int separator){
   for (int i = 0; i<8 ; i++)
   {
-    out[i][0] = (numeric[minute2][i]<<1) + (numeric[minute1][i]<<6);
-    out[i][1] = (numeric[hour2][i]<<6) + (numeric[minute1][i]>>2) + (numeric[colon][i]<<3);
-    out[i][2] = (numeric[hour1][i]<<3) + (numeric[hour2][i]>>2);
+    out[i][0] = (glyph(minute2,i)<<1) + (glyph(minute1,i)<<6);
+    out[i][1] = (glyph(hour2,i)<<6) + (glyph(minute1,i)>>2) + (glyph(separator,i)<<3);
+    out[i][2] = (glyph(hour1,i)<<3) + (glyph(hour2,i)>>2);
   }
 }
 
 void temperatureArrayFiling(int temperature1, int temperature2){
   for (int i = 0; i<8 ; i++)
   {
-    out[i][0] = (numeric[celsius][i]<<1) + (numeric[degree][i]<<5);
-    out[i][1] = (numeric[temperature1][i]<<6) + (numeric[temperature2][i]<<1);
-    out[i][2] = (numeric[temperature1][i]>>2);
+    out[i][0] = (glyph(celsius,i)<<1) + (glyph(degree,i)<<5);
+    out[i][1] = (glyph(temperature1,i)<<6) + (glyph(temperature2,i)<<1);
+    out[i][2] = (glyph(temperature1,i)>>2);
   }
 }
 
-void pressureArrayFiling(int pressure1, int pressure2, int pressure3){
+void pressureArrayFiling(int pressure1, int pressure2, int pressure3, int trend){
   for (int i = 0; i<8 ; i++)
   {
-    out[i][0] = (numeric[pressureSymbol][i]<<1) + (numeric[pressure3][i]<<6);
-    out[i][1] = (numeric[pressure2][i]<<3) + (numeric[pressure3][i]>>2);
-    out[i][2] = numeric[pressure1][i];
+    out[i][0] = (glyph(pressureSymbol,i)<<1) + (glyph(pressure3,i)<<6);
+    out[i][1] = (glyph(pressure2,i)<<3) + (glyph(pressure3,i)>>2);
+    out[i][2] = glyph(pressure1,i) + (glyph(trend,i)<<4);
   }
 }
 
@@ -356,12 +461,48 @@ void pressureArrayFiling(int pressure1, int pressure2, int pressure3){
 void humidityArrayFiling(int humidity1, int humidity2){
   for (int i = 0; i<8 ; i++)
   {
-    out[i][0] = (numeric[percent][i]<<1); //+ (numeric[humidity1][i]<<5);
-    out[i][1] = (numeric[humidity1][i]<<6) + (numeric[humidity2][i]<<1);
-    out[i][2] = (numeric[humidity1][i]>>2);
+    out[i][0] = (glyph(percent,i)<<1);
+    out[i][1] = (glyph(humidity1,i)<<6) + (glyph(humidity2,i)<<1);
+    out[i][2] = (glyph(humidity1,i)>>2);
   }
 }
 #endif
+
+void readSensors(){
+  sensorTemperature = bme.readTemperature();
+  sensorPressure = bme.readPressure() / 133.0F;
+#if HAS_HUMIDITY
+  sensorHumidity = bme.readHumidity();
+#endif
+}
+
+void recordPressureSample(){
+  pressureHistory[pressureHistoryHead] = int(sensorPressure);
+  pressureHistoryHead = (pressureHistoryHead + 1) % PRESSURE_HISTORY;
+  
+  if(pressureHistoryCount < PRESSURE_HISTORY){
+    pressureHistoryCount++;
+  }
+}
+
+// Compares against the oldest sample held, so the arrow appears after the first
+// quarter of an hour and widens to the full three hour window as the ring fills.
+int pressureTrendGlyph(){
+  if(pressureHistoryCount < 2){
+    return nullNumber;
+  }
+  
+  int oldest = pressureHistory[pressureHistoryCount < PRESSURE_HISTORY ? 0 : pressureHistoryHead];
+  int delta = int(sensorPressure) - oldest;
+  
+  if(delta >= PRESSURE_TREND_MMHG){
+    return trendUp;
+  }
+  if(delta <= -PRESSURE_TREND_MMHG){
+    return trendDown;
+  }
+  return trendSteady;
+}
 
 void startMarquee(){
   int hour1 = dt.hour / 10;
@@ -374,16 +515,16 @@ void startMarquee(){
   timeArrayFilling(hour1, hour2, minute1, minute2);
   marqueeCapturePage(page++);
   
-  int temperatureNow = int(bme.readTemperature());
+  int temperatureNow = int(sensorTemperature);
   temperatureArrayFiling(temperatureNow / 10, temperatureNow % 10);
   marqueeCapturePage(page++);
   
-  int pressureNow = int((bme.readPressure()/133.0F));
-  pressureArrayFiling(pressureNow / 100, pressureNow % 100 / 10, pressureNow % 10);
+  int pressureNow = int(sensorPressure);
+  pressureArrayFiling(pressureNow / 100, pressureNow % 100 / 10, pressureNow % 10, pressureTrendGlyph());
   marqueeCapturePage(page++);
   
 #if HAS_HUMIDITY
-  int humidityNow = int(bme.readHumidity());
+  int humidityNow = int(sensorHumidity);
   humidityArrayFiling(humidityNow / 10, humidityNow % 10);
   marqueeCapturePage(page++);
 #endif
@@ -434,8 +575,7 @@ int concatenateInt(int major, int minor){
 }
 
 void changeState(){
-  bool pinState = digitalRead(2);
-  Serial.println(pinState);
+  bool pinState = digitalRead(InterruptPin);
   
   if(pinState){
     debounceInterrupt = millis();
@@ -444,7 +584,7 @@ void changeState(){
     debounceInterrupt = millis() - debounceInterrupt;
   }
   
-  if (debounceInterrupt >= 1000 && debounceInterrupt <= 3000 && !pinState && lockInterrupt) {
+  if (debounceInterrupt >= 1000 && debounceInterrupt <= 3000 && !pinState) {
     
     if(state < settings)
     {
@@ -453,10 +593,9 @@ void changeState(){
     else{
       state ++;
     }
-    lockInterrupt = false;
   }
   
-  if (debounceInterrupt >= 1 && debounceInterrupt <= 300 &&!pinState && lockInterrupt) {
+  if (debounceInterrupt >= 1 && debounceInterrupt <= 300 &&!pinState) {
     
     if(state < settings)
     {
@@ -498,9 +637,5 @@ void changeState(){
         break;
       }
     }
-    
-    lockInterrupt = false;
   }
-  
-  lockInterrupt = true;
 }
