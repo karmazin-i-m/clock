@@ -59,6 +59,12 @@
 // One click steps through the screens. Holding does something only on the clock
 // screen, where it opens time programming, and inside programming, where it moves
 // to the next field. The same three seconds either way.
+// The button is wired active HIGH. D2 was measured idling LOW in 100% of samples
+// with the internal pull-up enabled and nothing pressed, and with zero edges, so
+// an external pull-down holds the line and pressing lifts it. Reading it the other
+// way round makes the firmware believe the button is held from the moment it boots.
+#define BUTTON_PRESSED_LEVEL HIGH
+
 #define BUTTON_DEBOUNCE_MS 25
 #define BUTTON_HOLD_MS 3000
 
@@ -607,11 +613,11 @@ int concatenateInt(int major, int minor){
 
 // Polled rather than interrupt driven. loop() now runs on a fixed ~4 ms cadence,
 // which is ample for a button, and it keeps press timing out of an ISR entirely.
-// The old handler classified the gap since the previous release rather than how
-// long the button was held, and had no debounce, so contact bounce alone stepped
-// through the screens.
+// The old handler did measure press duration correctly, but had no debounce: the
+// chatter on release produced several falling edges a few milliseconds apart, and
+// each one was taken for another short press, so the screens jumped in bursts.
 void updateButton(unsigned long now){
-  bool pressed = (digitalRead(ButtonPin) == LOW);
+  bool pressed = (digitalRead(ButtonPin) == BUTTON_PRESSED_LEVEL);
   
   if(pressed != buttonRaw){
     buttonRaw = pressed;
