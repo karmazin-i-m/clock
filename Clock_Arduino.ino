@@ -1,6 +1,18 @@
+// Board variant. Set to 0 for a board fitted with a BMP280, which measures
+// temperature and pressure but has no humidity sensor. Guarded so a build can
+// override it, e.g. arduino-cli --build-property
+// compiler.cpp.extra_flags=-DHAS_HUMIDITY=0
+#ifndef HAS_HUMIDITY
+#define HAS_HUMIDITY 1
+#endif
+
 #include <DS3231.h>
 #include <Adafruit_Sensor.h>
+#if HAS_HUMIDITY
 #include <Adafruit_BME280.h>
+#else
+#include <Adafruit_BMP280.h>
+#endif
 #include <Wire.h>
 
 #define InterruptPin 2
@@ -12,7 +24,11 @@
 
 #define RENDER_LINE_COUNT 8
 
+#if HAS_HUMIDITY
 #define MARQUEE_PAGE_COUNT 5
+#else
+#define MARQUEE_PAGE_COUNT 4
+#endif
 #define MARQUEE_PAGE_BYTES 3
 #define MARQUEE_STRIP_BYTES (MARQUEE_PAGE_COUNT * MARQUEE_PAGE_BYTES)
 #define MARQUEE_PAGE_COLUMNS 24
@@ -24,7 +40,9 @@
 const int times = 0;
 const int temperature = 1;
 const int pressure = 2;
+#if HAS_HUMIDITY
 const int humidity = 3;
+#endif
 const int altitude = 4;
 const int marquee = 5;
 const int settings = 100;
@@ -48,13 +66,19 @@ void temperatureArrayFiling(int temperature1, int temperature2);
 int concatenateInt(int major, int minor);
 void changeState();
 void lowInterrupt();
+#if HAS_HUMIDITY
 void humidityArrayFiling(int humidity1, int humidity2);
+#endif
 void startMarquee();
 void marqueeCapturePage(int page);
 void marqueeRender();
 
 DS3231 clk;
+#if HAS_HUMIDITY
 Adafruit_BME280 bme;
+#else
+Adafruit_BMP280 bme;
+#endif
 RTCDateTime dt;
 
 void setup() {
@@ -160,6 +184,7 @@ void loop() {
       pressureArrayFiling(pressure1, pressure2, pressure3);
     }
     break;
+#if HAS_HUMIDITY
     case humidity:
     {
       int humidity = int(bme.readHumidity());
@@ -168,9 +193,9 @@ void loop() {
       int humidity_major = humidity / 10;
       
       humidityArrayFiling(humidity_major, humidity_minore);
-      //humidityArrayFiling(0, 0);
     }
     break;
+#endif
     case marquee:
     {
       // The last page is the clock again, so hand straight back to `times` on arrival
@@ -327,6 +352,7 @@ void pressureArrayFiling(int pressure1, int pressure2, int pressure3){
   }
 }
 
+#if HAS_HUMIDITY
 void humidityArrayFiling(int humidity1, int humidity2){
   for (int i = 0; i<8 ; i++)
   {
@@ -335,6 +361,7 @@ void humidityArrayFiling(int humidity1, int humidity2){
     out[i][2] = (numeric[humidity1][i]>>2);
   }
 }
+#endif
 
 void startMarquee(){
   int hour1 = dt.hour / 10;
@@ -342,23 +369,27 @@ void startMarquee(){
   int minute1 = dt.minute / 10;
   int minute2 = dt.minute % 10;
   
+  int page = 0;
+  
   timeArrayFilling(hour1, hour2, minute1, minute2);
-  marqueeCapturePage(0);
+  marqueeCapturePage(page++);
   
   int temperatureNow = int(bme.readTemperature());
   temperatureArrayFiling(temperatureNow / 10, temperatureNow % 10);
-  marqueeCapturePage(1);
+  marqueeCapturePage(page++);
   
   int pressureNow = int((bme.readPressure()/133.0F));
   pressureArrayFiling(pressureNow / 100, pressureNow % 100 / 10, pressureNow % 10);
-  marqueeCapturePage(2);
+  marqueeCapturePage(page++);
   
+#if HAS_HUMIDITY
   int humidityNow = int(bme.readHumidity());
   humidityArrayFiling(humidityNow / 10, humidityNow % 10);
-  marqueeCapturePage(3);
+  marqueeCapturePage(page++);
+#endif
   
   timeArrayFilling(hour1, hour2, minute1, minute2);
-  marqueeCapturePage(4);
+  marqueeCapturePage(page++);
   
   marqueeStep = 0;
   marqueeStepTime = millis();
