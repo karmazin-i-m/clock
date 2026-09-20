@@ -38,17 +38,25 @@
 #define MARQUEE_HOLD_MS 5000
 #define MARQUEE_PERIOD_MINUTES 5
 
-// Every row gets the same slot and is blanked at the end of it, so brightness
-// stops depending on how long loop() happened to take. Dimming is simply a
-// shorter lit fraction of that same slot, which leaves the frame rate alone.
+// Rows are advanced by Timer1, not by loop(), so the slot really is fixed and
+// brightness no longer depends on what else the pass happened to do. Dimming is
+// simply a shorter lit fraction of that same slot, which leaves the frame rate
+// alone. Timer1 runs on the /8 prescaler, so one tick is 0.5 us at 16 MHz.
 #define ROW_PERIOD_US 500
 #define ROW_ON_BRIGHT_US 450
 #define ROW_ON_DIM_US 60
+#define TIMER1_TICKS_PER_US 2
+#define ROW_PERIOD_TICKS (ROW_PERIOD_US * TIMER1_TICKS_PER_US)
+#define FRAME_PERIOD_MS ((ROW_PERIOD_US * 8UL) / 1000)
 #define DIM_FROM_HOUR 22
 #define DIM_UNTIL_HOUR 7
 
 #define CLOCK_POLL_MS 100
-#define SENSOR_POLL_MS 1000
+// Every sensor read is blocking I2C in the gap between two frames, so it costs
+// the panel a dark window and shows up as a brightness dip. At one second the
+// dip was a visible flicker and it bought nothing: the sensor itself converts
+// in ~112 ms and every screen rounds to whole degrees, mmHg and percent.
+#define SENSOR_POLL_MS 10000
 
 // Twelve samples a quarter of an hour apart give the three hour window that
 // pressure trends are conventionally read over.
@@ -107,7 +115,8 @@ const int trendUp = 16;
 const int trendDown = 17;
 const int trendSteady = 18;
 
-void visual();
+void commitFrame();
+static void startRendering();
 void timeArrayFilling(int hour1 = nullNumber, int hour2 = nullNumber, int minute1 = nullNumber, int minute2 = nullNumber, int separator = colon);
 void pressureArrayFiling(int pressure1, int pressure2, int pressure3, int trend = nullNumber);
 void temperatureArrayFiling(int temperature1, int temperature2);
@@ -133,7 +142,9 @@ Adafruit_BMP280 bme;
 #endif
 RTCDateTime dt;
 
-uint16_t rowOnMicros = ROW_ON_BRIGHT_US;
+// Read by the row interrupt, written by loop(). Sixteen bit, so loop() has to
+// write it with interrupts off or the interrupt can catch half of a new value.
+volatile uint16_t rowOnTicks = ROW_ON_BRIGHT_US * TIMER1_TICKS_PER_US;
 
 float sensorTemperature;
 float sensorPressure;
@@ -142,6 +153,7 @@ float sensorHumidity;
 #endif
 unsigned long sensorReadTime;
 unsigned long clockReadTime;
+unsigned long frameComposeTime;
 
 int pressureHistory[PRESSURE_HISTORY];
 uint8_t pressureHistoryCount;
@@ -161,6 +173,12 @@ void setup() {
 
   unsigned status;
   status = bme.begin(0x76);
+
+  // Fast mode, which both the DS3231 and the BME280/BMP280 support. It has to
+  // come last: clk.begin() and bme.begin() each call Wire.begin(), which reruns
+  // twi_init and would put the bus back to 100 kHz. Four times the bus speed is
+  // a quarter of the dark window that every blocking read punches in a frame.
+  Wire.setClock(400000);
   
   Serial.begin(9600);
   Serial.println("Initialized");
@@ -169,6 +187,8 @@ void setup() {
   recordPressureSample();
   sensorReadTime = millis();
   pressureSampleTime = millis();
+
+  startRendering();
 }
 
 const uint8_t catode[8] PROGMEM = {2, 4, 8, 16, 32, 64, 128, 1};
@@ -249,13 +269,27 @@ void loop() {
   if(state < settings && state != marquee && now - clockReadTime >= CLOCK_POLL_MS){
     clockReadTime = now;
     dt = clk.getDateTime();
-    rowOnMicros = (dt.hour >= DIM_FROM_HOUR || dt.hour < DIM_UNTIL_HOUR) ? ROW_ON_DIM_US : ROW_ON_BRIGHT_US;
+    uint16_t ticks = (dt.hour >= DIM_FROM_HOUR || dt.hour < DIM_UNTIL_HOUR) ?
+      ROW_ON_DIM_US * TIMER1_TICKS_PER_US : ROW_ON_BRIGHT_US * TIMER1_TICKS_PER_US;
+    noInterrupts();
+    rowOnTicks = ticks;
+    interrupts();
     
     if(dt.minute % MARQUEE_PERIOD_MINUTES == 0 && dt.minute != lastMarqueeMinute){
       lastMarqueeMinute = dt.minute;
       startMarquee();
     }
   }
+  
+  // Everything above still runs every pass, which is now microseconds rather
+  // than the four milliseconds a software rendered frame used to cost - the
+  // button only gets polled more finely for it. Composing a screen that often
+  // would be pure waste though, because the interrupt consumes exactly one
+  // frame per FRAME_PERIOD_MS, so the rest of the pass keeps the old cadence.
+  if(now - frameComposeTime < FRAME_PERIOD_MS){
+    return;
+  }
+  frameComposeTime = now;
   
   switch(state){
     case times:
@@ -418,7 +452,7 @@ void loop() {
     break;
   }
   
-  visual();
+  commitFrame();
 }
 
 // All five display pins sit on PORTD, so the registers can be clocked with
@@ -457,17 +491,53 @@ static void latchRow(uint8_t byte0, uint8_t byte1, uint8_t byte2, uint8_t row){
   PORTD |= LATCH_BIT;
 }
 
-// A row used to stay lit until the next one was latched, so the last row of a
-// frame also burned through everything loop() did afterwards - the bottom line
-// was brighter, and by an amount that varied with the screen being shown. Now
-// every row gets an identical slot and is blanked at the end of it.
-void visual(){
-  for(uint8_t i = 0; i < 8; i++){
-    latchRow(out[i][0], out[i][1], out[i][2], pgm_read_byte(&catode[i]));
-    delayMicroseconds(rowOnMicros);
-    latchRow(0, 0, 0, 0);
-    delayMicroseconds(ROW_PERIOD_US - rowOnMicros);
-  }
+// The frame the interrupt actually latches. loop() keeps composing into out[][]
+// exactly as before and publishes the result here in one go, so a row can never
+// be latched from a screen that is half rebuilt.
+volatile uint8_t frame[8][3] = {};
+static volatile uint8_t renderRow = 0;
+
+// Rows used to be advanced by a delay loop inside loop(), which fixed the lit
+// time per row but not the period of a frame: any blocking work - an I2C read
+// of the RTC or the sensor - stretched the frame while the panel was dark, and
+// showed up as a brightness dip. Timer1 now advances the rows on its own, so a
+// blocking pass costs nothing visible and brightness is genuinely
+// rowOnTicks / ROW_PERIOD_TICKS.
+//
+// COMPA is the start of a row slot and latches it lit, COMPB lands rowOnTicks
+// later and blanks it. ROW_ON_DIM_US has to stay comfortably above the ~37 us
+// that latchRow spends shifting, or COMPB would fire while COMPA is still busy.
+ISR(TIMER1_COMPA_vect){
+  uint8_t row = renderRow;
+  OCR1B = rowOnTicks;
+  latchRow(frame[row][0], frame[row][1], frame[row][2], pgm_read_byte(&catode[row]));
+}
+
+ISR(TIMER1_COMPB_vect){
+  latchRow(0, 0, 0, 0);
+  renderRow = (renderRow + 1) & 7;
+}
+
+// CTC on OCR1A with the /8 prescaler: the slot is exactly ROW_PERIOD_TICKS and
+// does not drift with what loop() is doing. Started after pinMode(), so the
+// interrupt never shifts into a port that is still an input.
+static void startRendering(){
+  noInterrupts();
+  TCCR1A = 0;
+  TCCR1B = (1 << WGM12) | (1 << CS11);
+  TCNT1 = 0;
+  OCR1A = ROW_PERIOD_TICKS - 1;
+  OCR1B = rowOnTicks;
+  TIMSK1 = (1 << OCIE1A) | (1 << OCIE1B);
+  interrupts();
+}
+
+// Twenty four bytes with interrupts off, which delays a row edge by a few
+// microseconds out of five hundred and is the same cost on every pass.
+void commitFrame(){
+  noInterrupts();
+  memcpy((void *)frame, out, sizeof(out));
+  interrupts();
 }
 
 void timeArrayFilling(int hour1, int hour2, int minute1, int minute2, int separator){

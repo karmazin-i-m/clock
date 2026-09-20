@@ -95,24 +95,43 @@ With `HAS_HUMIDITY 0` the sensor class becomes `Adafruit_BMP280`, and the humidi
 dropped rather than rendered as a literal `00%`: `MARQUEE_PAGE_COUNT` falls to 4 and `case
 humidity` disappears, so the button cycle runs clock → temperature → pressure → clock through
 the existing `default` reset. Verify both configurations compile after touching display code;
-as of the consolidation they are 16286 and 15540 bytes of flash.
+as of the move to interrupt driven rendering they are 16680 and 16072 bytes of flash.
 
 One piece of history worth keeping: the deleted Atmel Studio copy of this firmware used a
 **different pin map** — `LatchPin`/`ClockPin` 3/4 rather than 4/3, and
 `CatodeDataPin`/`CatodeClockPin` 6/7 rather than 7/6. If a board ever turns up whose display
 is scrambled, that mapping is the thing to try.
 
-The `.ino` file is CRLF; keep it that way when editing.
+`core.autocrlf` is `input` and the working copy is LF; keep it that way when editing.
 
 ## Firmware architecture
 
 **Pins (canonical `.ino`)**: button on D2 (INT0, `INPUT_PULLUP`), row/anode shift register on
 D5 data + D3 clock, column/cathode shift register chain on D7 data + D6 clock, shared latch on D4.
 
-**Rendering.** `out[8][3]` is the frame buffer: 8 rows × 3 bytes = 24 columns. `visual()` runs
-once per `loop()` and multiplexes the panel — for each row it clocks three cathode bytes out
-LSB-first, then one anode byte (`catode[]`, a rotating one-hot row select) MSB-first, then
-pulses the latch.
+**Rendering.** `out[8][3]` is the buffer `loop()` composes into; `frame[8][3]` is the one the
+renderer latches, and `commitFrame()` publishes the first into the second with a 24 byte
+`memcpy` under `noInterrupts()`, so a row is never latched from a half rebuilt screen.
+`latchRow()` clocks three cathode bytes out LSB-first, then one anode byte (`catode[]`, a
+rotating one-hot row select) MSB-first, then pulses the latch.
+
+**The panel is multiplexed from Timer1, not from `loop()`.** `startRendering()`, called at the
+end of `setup()` after `pinMode()`, puts Timer1 in CTC mode on the /8 prescaler (one tick =
+0.5 µs). `OCR1A` is `ROW_PERIOD_TICKS - 1`, so `TIMER1_COMPA_vect` opens every row slot and
+latches that row lit; `OCR1B` is `rowOnTicks`, so `TIMER1_COMPB_vect` lands inside the slot,
+blanks the row and advances `renderRow`. Each ISR spends ~38 µs bit banging, i.e. ~15% of the
+CPU, and `loop()` is free to block for as long as it likes without the display noticing.
+
+This replaced a software multiplex that ran once per `loop()`. That version fixed the lit time
+per row but not the *period* of a frame, so every blocking I2C read stretched a frame while
+the panel was dark: the sensor poll cost 3 ms on a 4.75 ms loop and read as a once-per-second
+flicker, the RTC poll cost 1.1 ms ten times a second and read as a shimmer. Both are gone.
+
+Two constraints the ISRs impose. `ROW_ON_DIM_US` must stay above the ~38 µs `latchRow()` needs,
+or `COMPB` would fire while `COMPA` is still shifting; and `rowOnTicks` must stay below `OCR1A`,
+or `COMPB` never fires at all and one row sticks on. Both hold with room to spare at 60/450 µs
+out of 500. `rowOnTicks` is 16 bit and written by `loop()`, so it is written with interrupts
+off — the ISR would otherwise be able to catch half of a new value.
 
 All five display pins are on PORTD, so the bit banging goes straight to the port (`sbi`/`cbi`)
 rather than through `shiftOut`/`digitalWrite`. Read-modify-write is confined to those five
@@ -123,9 +142,19 @@ Each row gets an identical `ROW_PERIOD_US` slot and is **blanked** at the end of
 (`latchRow(0,0,0,0)`). That is load-bearing: previously a row stayed lit until the next one
 was latched, so the last row of a frame also burned through everything `loop()` did
 afterwards — the bottom line was brighter, by an amount that changed with the screen being
-shown. Brightness is now `rowOnMicros / ROW_PERIOD_US`, which is also the whole dimming
-mechanism: `rowOnMicros` drops to `ROW_ON_DIM_US` between `DIM_FROM_HOUR` and
+shown. Brightness is exactly `rowOnTicks / ROW_PERIOD_TICKS`, which is also the whole dimming
+mechanism: `rowOnTicks` drops to `ROW_ON_DIM_US` worth of ticks between `DIM_FROM_HOUR` and
 `DIM_UNTIL_HOUR`. Dimming does not change the frame rate.
+
+**Loop cadence.** With rendering in the ISR, `loop()` itself runs in microseconds. The button
+poll, the idle return and the sensor/RTC timers run on every pass and only gain resolution from
+it, but composing a screen that often would be waste, so `loop()` returns early unless
+`FRAME_PERIOD_MS` has passed — the switch that fills `out[][]` and `commitFrame()` keep the
+~4 ms cadence the renderer actually consumes.
+
+**I2C runs at 400 kHz.** `Wire.setClock(400000)` in `setup()` must stay *after* both
+`clk.begin()` and `bme.begin()`, each of which calls `Wire.begin()` and would reset the bus to
+100 kHz. It no longer affects brightness, but it still quarters the time every poll blocks.
 
 **Font.** `numeric[][8]` holds 8 rows per glyph: digits 0–9, then `colon`(10), `degree`(11),
 `celsius`(12), `pressureSymbol`(13), `nullNumber`(14, blank), `percent`(15), `trendUp`(16),
@@ -184,7 +213,7 @@ active LOW and is not. Measured with a probe sketch: D2 idles LOW in 100% of sam
 edges, while nothing is pressed and the internal pull-up is on. An external pull-down holds the
 line and pressing lifts it. Read it as active LOW and the firmware believes the button is held
 from the moment it boots, so it drops into time programming three seconds after power-up
-without anybody touching it. There is no interrupt: `loop()` runs on a fixed ~4 ms
+without anybody touching it. The button has no interrupt of its own: `loop()` runs at well under 1 ms
 cadence, which is ample for a button and keeps press timing out of an ISR.
 
 - **Click** steps through the screens (`DISPLAY_MODE_COUNT`, which follows `HAS_HUMIDITY`) and
