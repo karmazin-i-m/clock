@@ -14,6 +14,7 @@
 #include <Adafruit_BMP280.h>
 #endif
 #include <Wire.h>
+#include <EEPROM.h>
 #include <avr/pgmspace.h>
 
 #define ButtonPin 2
@@ -48,6 +49,10 @@
 #define TIMER1_TICKS_PER_US 2
 #define ROW_PERIOD_TICKS (ROW_PERIOD_US * TIMER1_TICKS_PER_US)
 #define FRAME_PERIOD_MS ((ROW_PERIOD_US * 8UL) / 1000)
+
+// Defaults only. The ESP-01 can change the dimming window and the marquee
+// period over the link, and what it sets is kept in EEPROM, so these are what a
+// blank chip starts from.
 #define DIM_FROM_HOUR 22
 #define DIM_UNTIL_HOUR 7
 
@@ -57,6 +62,26 @@
 // dip was a visible flicker and it bought nothing: the sensor itself converts
 // in ~112 ms and every screen rounds to whole degrees, mmHg and percent.
 #define SENSOR_POLL_MS 10000
+
+// The ESP-01 on the hardware UART. Frames are one line of ASCII ending in a XOR
+// checksum, and anything that fails it is dropped without a reply - the ESP's
+// boot ROM talks at 74880 baud on this same wire every time it starts, and that
+// noise must never be mistaken for a command.
+//
+// A reply has to fit in the 64 byte hardware transmit buffer - 63 usable - or
+// Serial.print blocks loop() until the wire drains, at about a millisecond a
+// byte. Two replies can leave in one pass, because the ESP polls for readings
+// and settings on schedules that coincide, so the pair is what has to fit: a
+// status frame is at most 40 bytes on the wire and a config frame 16.
+#define LINK_BAUD 9600
+#define LINK_BUFFER 48
+
+// Signature, version, then the three settable bytes. A chip that does not carry
+// the signature keeps the compiled defaults rather than three bytes of 0xFF.
+#define CONFIG_ADDRESS 0
+#define CONFIG_SIGNATURE_A 'K'
+#define CONFIG_SIGNATURE_B 'C'
+#define CONFIG_VERSION 1
 
 // Twelve samples a quarter of an hour apart give the three hour window that
 // pressure trends are conventionally read over.
@@ -133,6 +158,11 @@ void humidityArrayFiling(int humidity1, int humidity2);
 void startMarquee();
 void marqueeCapturePage(int page);
 void marqueeRender();
+void updateLink();
+void linkSend(const char *payload);
+void loadConfig();
+void saveConfig();
+static bool dimmedAt(uint8_t hour);
 
 DS3231 clk;
 #if HAS_HUMIDITY
@@ -154,6 +184,15 @@ float sensorHumidity;
 unsigned long sensorReadTime;
 unsigned long clockReadTime;
 unsigned long frameComposeTime;
+
+// Settable from the ESP, persisted in EEPROM, seeded from the defines above.
+uint8_t dimFromHour = DIM_FROM_HOUR;
+uint8_t dimUntilHour = DIM_UNTIL_HOUR;
+uint8_t marqueePeriodMinutes = MARQUEE_PERIOD_MINUTES;
+
+char linkBuffer[LINK_BUFFER];
+uint8_t linkLength;
+bool linkOverflow;
 
 int pressureHistory[PRESSURE_HISTORY];
 uint8_t pressureHistoryCount;
@@ -180,15 +219,26 @@ void setup() {
   // a quarter of the dark window that every blocking read punches in a frame.
   Wire.setClock(400000);
   
-  Serial.begin(9600);
-  Serial.println("Initialized");
-  
+  Serial.begin(LINK_BAUD);
+  loadConfig();
+
+  // The first RTC read used to wait a hundred milliseconds for the timer in
+  // loop(), which left the opening frames composing from an uninitialised dt.
+  // Harmless when nobody was watching the first tenth of a second; not harmless
+  // now that the ESP can ask for the time before then.
+  dt = clk.getDateTime();
+
   readSensors();
   recordPressureSample();
   sensorReadTime = millis();
   pressureSampleTime = millis();
 
   startRendering();
+
+  // Replaces the old "Initialized" banner, which was the one thing on this wire
+  // the ESP could not parse. It also tells the ESP the clock restarted, so it
+  // pushes the time again rather than waiting out its hour.
+  linkSend("<B");
 }
 
 const uint8_t catode[8] PROGMEM = {2, 4, 8, 16, 32, 64, 128, 1};
@@ -246,7 +296,8 @@ void loop() {
   unsigned long now = millis();
   
   updateButton(now);
-  
+  updateLink();
+
   // The marquee is left alone as well: it runs on its own clock and already ends
   // on the clock screen, so timing it out would only truncate it.
   if(state > times && state < settings && state != marquee && now - buttonActivityTime >= IDLE_RETURN_MS){
@@ -269,15 +320,25 @@ void loop() {
   if(state < settings && state != marquee && now - clockReadTime >= CLOCK_POLL_MS){
     clockReadTime = now;
     dt = clk.getDateTime();
-    uint16_t ticks = (dt.hour >= DIM_FROM_HOUR || dt.hour < DIM_UNTIL_HOUR) ?
+    uint16_t ticks = dimmedAt(dt.hour) ?
       ROW_ON_DIM_US * TIMER1_TICKS_PER_US : ROW_ON_BRIGHT_US * TIMER1_TICKS_PER_US;
     noInterrupts();
     rowOnTicks = ticks;
     interrupts();
-    
-    if(dt.minute % MARQUEE_PERIOD_MINUTES == 0 && dt.minute != lastMarqueeMinute){
-      lastMarqueeMinute = dt.minute;
-      startMarquee();
+
+    // A period of zero turns the marquee off, and guards the modulo besides.
+    if(marqueePeriodMinutes > 0){
+      if(dt.minute % marqueePeriodMinutes != 0){
+        // Forgetting the last run as soon as the minute stops matching is what
+        // makes a period of sixty work. Held instead, the single candidate
+        // minute would equal lastMarqueeMinute for ever after the first run and
+        // the marquee would never start again.
+        lastMarqueeMinute = -1;
+      }
+      else if(dt.minute != lastMarqueeMinute){
+        lastMarqueeMinute = dt.minute;
+        startMarquee();
+      }
     }
   }
   
@@ -682,6 +743,277 @@ void marqueeRender(){
 
 int concatenateInt(int major, int minor){
   return (major*10) + minor;
+}
+
+// The window wraps midnight in the default case - twenty two to seven - but
+// nothing stops the ESP setting a daytime one, so both orders have to work. The
+// old expression only handled the wrapping case and would have dimmed around
+// the clock for, say, seven to twenty two.
+//
+// Both ends are boundaries on a 0..24 line, not hours of the day, and the end
+// is half open. That is what lets the two extremes be said at all: 0 to 24
+// dims around the clock, and any pair that is equal - 0 to 0, 24 to 24 - never
+// dims. Twenty four is legal at the start too, where it simply reads as the
+// far end and so behaves like zero.
+static bool dimmedAt(uint8_t hour){
+  if(dimFromHour == dimUntilHour){
+    return false;
+  }
+
+  if(dimFromHour > dimUntilHour){
+    return hour >= dimFromHour || hour < dimUntilHour;
+  }
+
+  return hour >= dimFromHour && hour < dimUntilHour;
+}
+
+void loadConfig(){
+  if(EEPROM.read(CONFIG_ADDRESS) != CONFIG_SIGNATURE_A ||
+     EEPROM.read(CONFIG_ADDRESS + 1) != CONFIG_SIGNATURE_B ||
+     EEPROM.read(CONFIG_ADDRESS + 2) != CONFIG_VERSION){
+    return;
+  }
+
+  uint8_t from = EEPROM.read(CONFIG_ADDRESS + 3);
+  uint8_t until = EEPROM.read(CONFIG_ADDRESS + 4);
+  uint8_t period = EEPROM.read(CONFIG_ADDRESS + 5);
+
+  if(from <= 24){ dimFromHour = from; }
+  if(until <= 24){ dimUntilHour = until; }
+  if(period <= 60){ marqueePeriodMinutes = period; }
+}
+
+// update() rather than write(), so a value that has not changed costs nothing
+// and the cell is not worn down by a form that was submitted unaltered. Each
+// byte that does change stalls this function for ~3.3 ms, but with interrupts
+// on, so the panel keeps refreshing throughout.
+void saveConfig(){
+  EEPROM.update(CONFIG_ADDRESS, CONFIG_SIGNATURE_A);
+  EEPROM.update(CONFIG_ADDRESS + 1, CONFIG_SIGNATURE_B);
+  EEPROM.update(CONFIG_ADDRESS + 2, CONFIG_VERSION);
+  EEPROM.update(CONFIG_ADDRESS + 3, dimFromHour);
+  EEPROM.update(CONFIG_ADDRESS + 4, dimUntilHour);
+  EEPROM.update(CONFIG_ADDRESS + 5, marqueePeriodMinutes);
+}
+
+void linkSend(const char *payload){
+  uint8_t sum = 0;
+  for(const char *p = payload; *p; p++){
+    sum ^= (uint8_t)*p;
+  }
+
+  Serial.print(payload);
+  Serial.print('*');
+  if(sum < 0x10){
+    Serial.print('0');
+  }
+  Serial.println(sum, HEX);
+}
+
+static int linkHexDigit(char c){
+  if(c >= '0' && c <= '9'){ return c - '0'; }
+  if(c >= 'A' && c <= 'F'){ return c - 'A' + 10; }
+  if(c >= 'a' && c <= 'f'){ return c - 'a' + 10; }
+  return -1;
+}
+
+// Trims the checksum off the line and says whether it matched.
+static bool linkVerify(char *line){
+  char *star = strrchr(line, '*');
+  if(star == NULL || strlen(star) != 3){
+    return false;
+  }
+
+  int high = linkHexDigit(star[1]);
+  int low = linkHexDigit(star[2]);
+  if(high < 0 || low < 0){
+    return false;
+  }
+
+  uint8_t given = (uint8_t)(high * 16 + low);
+  *star = '\0';
+
+  uint8_t sum = 0;
+  for(char *p = line; p < star; p++){
+    sum ^= (uint8_t)*p;
+  }
+
+  return sum == given;
+}
+
+static int linkDigits(const char *p, uint8_t count){
+  int value = 0;
+  for(uint8_t i = 0; i < count; i++){
+    if(p[i] < '0' || p[i] > '9'){
+      return -1;
+    }
+    value = value * 10 + (p[i] - '0');
+  }
+  return value;
+}
+
+// " 2026-09-21 14:03:22", fixed width. The ESP is the only thing that speaks
+// this, so being strict costs nothing and rejects noise for free.
+static void linkSetTime(const char *args){
+  // Length first. updateLink() reuses linkBuffer without clearing it, so a
+  // short frame that passed its checksum would otherwise have the separator
+  // test reading the tail of whatever longer frame came before.
+  if(strlen(args) < 20){
+    linkSend("<E");
+    return;
+  }
+
+  if(args[0] != ' ' || args[5] != '-' || args[8] != '-' ||
+     args[11] != ' ' || args[14] != ':' || args[17] != ':'){
+    linkSend("<E");
+    return;
+  }
+
+  int year = linkDigits(args + 1, 4);
+  int month = linkDigits(args + 6, 2);
+  int day = linkDigits(args + 9, 2);
+  int hour = linkDigits(args + 12, 2);
+  int minute = linkDigits(args + 15, 2);
+  int second = linkDigits(args + 18, 2);
+
+  if(year < 2000 || month < 1 || month > 12 || day < 1 || day > 31 ||
+     hour > 23 || minute > 59 || second > 59 ||
+     hour < 0 || minute < 0 || second < 0){
+    linkSend("<E");
+    return;
+  }
+
+  // Being overruled mid edit by a frame off the wire would be worse than the
+  // few seconds of drift that waiting costs.
+  if(state >= settings){
+    linkSend("<E");
+    return;
+  }
+
+  clk.setDateTime(year, month, day, hour, minute, second);
+  dt = clk.getDateTime();
+  linkSend("<K");
+}
+
+static void linkSendStatus(){
+  int humidityValue = -1;
+#if HAS_HUMIDITY
+  if(!isnan(sensorHumidity)){
+    humidityValue = constrain(int(sensorHumidity), 0, 100);
+  }
+#endif
+
+  // Clamped, and not for tidiness: bme.begin() discards its status, so a sensor
+  // that never answered leaves these NaN, and int(NaN) on this compiler is
+  // -32768. Six characters in each of three fields would push the frame past
+  // what the transmit buffer can hold alongside a second reply in the same pass.
+  int temperatureTenths = isnan(sensorTemperature) ? -999 : constrain(int(sensorTemperature * 10), -999, 999);
+  int pressureValue = isnan(sensorPressure) ? -1 : constrain(int(sensorPressure), 0, 9999);
+
+  // dt is only refreshed while a clock family screen is showing, so during a
+  // marquee or a programming session it would reach the web page minutes stale.
+  // Read the RTC straight into a local for those - not over dt, which case
+  // settings has latched the date out of.
+  RTCDateTime stamp = (state >= settings || state == marquee) ? clk.getDateTime() : dt;
+
+  // Temperature travels in tenths of a degree as a plain integer: formatting a
+  // float on this chip costs over a kilobyte of flash and buys nothing, since
+  // the ESP only has to divide it again.
+  char body[56];
+  snprintf(body, sizeof(body), "<S %04u-%02u-%02u %02u:%02u:%02u %d %d %d",
+    (unsigned)stamp.year, (unsigned)stamp.month, (unsigned)stamp.day,
+    (unsigned)stamp.hour, (unsigned)stamp.minute, (unsigned)stamp.second,
+    temperatureTenths, pressureValue, humidityValue);
+
+  linkSend(body);
+}
+
+static void linkSendConfig(){
+  char body[32];
+  snprintf(body, sizeof(body), "<C %u %u %u",
+    (unsigned)dimFromHour, (unsigned)dimUntilHour, (unsigned)marqueePeriodMinutes);
+
+  linkSend(body);
+}
+
+static void linkSetConfig(char *args){
+  while(*args == ' '){
+    args++;
+  }
+
+  char *value = strchr(args, ' ');
+  if(value == NULL){
+    linkSend("<E");
+    return;
+  }
+  *value++ = '\0';
+
+  int number = atoi(value);
+
+  if(strcmp(args, "dimfrom") == 0 && number >= 0 && number <= 24){
+    dimFromHour = number;
+  }
+  else if(strcmp(args, "dimuntil") == 0 && number >= 0 && number <= 24){
+    dimUntilHour = number;
+  }
+  else if(strcmp(args, "marquee") == 0 && number >= 0 && number <= 60){
+    marqueePeriodMinutes = number;
+  }
+  else {
+    linkSend("<E");
+    return;
+  }
+
+  saveConfig();
+  linkSend("<K");
+}
+
+static void handleLinkFrame(char *line){
+  // Not addressed to us, so not even worth an error frame - this is where the
+  // ESP's boot chatter lands.
+  if(line[0] != '>' || !linkVerify(line)){
+    return;
+  }
+
+  switch(line[1]){
+    case 'T': linkSetTime(line + 2); break;
+    case 'Q': linkSendStatus(); break;
+    case 'G': linkSendConfig(); break;
+    case 'C': linkSetConfig(line + 2); break;
+    default:  linkSend("<E"); break;
+  }
+}
+
+// Called on every pass. At 9600 baud a byte arrives about once a millisecond
+// and the hardware buffer holds sixty four of them, so loop() drains it many
+// times over between arrivals and nothing here ever blocks.
+void updateLink(){
+  while(Serial.available()){
+    char c = Serial.read();
+
+    if(c == '\r'){
+      continue;
+    }
+
+    if(c == '\n'){
+      if(!linkOverflow && linkLength > 0){
+        linkBuffer[linkLength] = '\0';
+        handleLinkFrame(linkBuffer);
+      }
+      linkLength = 0;
+      linkOverflow = false;
+      continue;
+    }
+
+    // Swallow the rest of an over long line rather than splitting it into two
+    // frames, either of which would then fail its checksum anyway.
+    if(linkLength >= LINK_BUFFER - 1){
+      linkOverflow = true;
+      continue;
+    }
+
+    linkBuffer[linkLength++] = c;
+  }
 }
 
 // Polled rather than interrupt driven. loop() now runs on a fixed ~4 ms cadence,

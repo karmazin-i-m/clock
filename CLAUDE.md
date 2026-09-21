@@ -12,14 +12,16 @@ The repo is not only firmware — it also holds the mechanical and electrical de
 
 | Directory | Contents |
 |---|---|
-| `Clock_Arduino/` | Firmware as Arduino sketches. **This is the canonical source.** |
+| `Clock_Arduino/` | Clock firmware as an Arduino sketch. **This is the canonical source.** |
+| `Clock_ESP01/` | ESP-01 firmware: captive portal, NTP, settings page |
 | `Clock/Arduino Nano 3/` | Proteus (`.pdsprj`) simulation of the circuit |
 | `Gerber files/` | Fabrication zips for three boards: Control, Display, ESP01 template |
 | `Autocad_Model/` | AutoCAD drawings of the enclosure and the GNM-23881 display module |
 | `GNM-23881AEG/` | Datasheet for the LED matrix module |
 
-The outer directory is **not** a git repo; `Clock_Arduino/` is a nested repo pointing at
-Azure DevOps (`dev.azure.com/karmazin-i-m/Clock`). Changes outside `Clock_Arduino/` are untracked.
+The whole project is one git repo, on GitHub at `karmazin-i-m/clock`. `Clock_Arduino/` used to
+be a nested repo of its own pointing at Azure DevOps; it is a plain directory now, and there
+are no submodules.
 
 ## Building and flashing
 
@@ -60,10 +62,16 @@ writable by default and both upload and monitor fail with `Permission denied`. `
 a+rw /dev/ttyUSB0` fixes it until the board is unplugged; `sudo usermod -aG dialout $USER`
 plus a re-login fixes it for good. Check `ls -l /dev/ttyUSB0` before blaming the firmware.
 
-**Reading the serial banner.** The sketch prints `Initialized` once, in `setup()`. Neither
-`arduino-cli monitor` nor `cat /dev/ttyUSB0` reliably produces a DTR edge, so the board never
-resets and you see nothing — this looks exactly like a dead board but is not. Pulse DTR/RTS
-low then high over the open fd (`TIOCMSET`) and read for a few seconds to get the banner.
+**Reading the serial line.** The UART now belongs to the ESP-01 (see below), so `setup()` no
+longer prints `Initialized` — it sends a `<B` frame instead. The old advice still applies to
+watching that line: neither `arduino-cli monitor` nor `cat /dev/ttyUSB0` reliably produces a
+DTR edge, so the board never resets and you see nothing, which looks exactly like a dead board
+and is not. Pulse DTR/RTS low then high over the open fd (`TIOCMSET`) and read for a few
+seconds. Failing that, poke it: send `>Q*` with a valid checksum and a `<S` frame comes back.
+
+**Unplug the ESP before flashing the Nano.** `arduino-cli upload` drives D0 from the USB
+bridge; an ESP transmitting into the same pin corrupts the upload. This is what the jumper in
+the ESP TX line is for.
 
 Libraries: `Wire`, `Adafruit_Sensor`, `Adafruit_BME280`, `Adafruit_BMP280`, and Jarzebski's
 `DS3231` — the one exposing `RTCDateTime`, which is not in the library index and is installed
@@ -95,7 +103,9 @@ With `HAS_HUMIDITY 0` the sensor class becomes `Adafruit_BMP280`, and the humidi
 dropped rather than rendered as a literal `00%`: `MARQUEE_PAGE_COUNT` falls to 4 and `case
 humidity` disappears, so the button cycle runs clock → temperature → pressure → clock through
 the existing `default` reset. Verify both configurations compile after touching display code;
-as of the move to interrupt driven rendering they are 16680 and 16072 bytes of flash.
+as of the ESP link they are 20236 and 19500 bytes of flash. The variant also reaches the wire:
+`linkSendStatus()` sends `-1` for humidity on a BMP280 board, and the ESP's page renders that
+as "no sensor" rather than as a reading.
 
 One piece of history worth keeping: the deleted Atmel Studio copy of this firmware used a
 **different pin map** — `LatchPin`/`ClockPin` 3/4 rather than 4/3, and
@@ -107,7 +117,9 @@ is scrambled, that mapping is the thing to try.
 ## Firmware architecture
 
 **Pins (canonical `.ino`)**: button on D2 (INT0, `INPUT_PULLUP`), row/anode shift register on
-D5 data + D3 clock, column/cathode shift register chain on D7 data + D6 clock, shared latch on D4.
+D5 data + D3 clock, column/cathode shift register chain on D7 data + D6 clock, shared latch on
+D4, ESP-01 on D0/D1, sensors on A4/A5. That leaves D8–D13 and A0–A3 free, and A6/A7 free but
+analog-input only — they cannot be digital pins.
 
 **Rendering.** `out[8][3]` is the buffer `loop()` composes into; `frame[8][3]` is the one the
 renderer latches, and `commitFrame()` publishes the first into the second with a 24 byte
@@ -143,8 +155,20 @@ Each row gets an identical `ROW_PERIOD_US` slot and is **blanked** at the end of
 was latched, so the last row of a frame also burned through everything `loop()` did
 afterwards — the bottom line was brighter, by an amount that changed with the screen being
 shown. Brightness is exactly `rowOnTicks / ROW_PERIOD_TICKS`, which is also the whole dimming
-mechanism: `rowOnTicks` drops to `ROW_ON_DIM_US` worth of ticks between `DIM_FROM_HOUR` and
-`DIM_UNTIL_HOUR`. Dimming does not change the frame rate.
+mechanism: `rowOnTicks` drops to `ROW_ON_DIM_US` worth of ticks whenever `dimmedAt(dt.hour)`
+says so. Dimming does not change the frame rate.
+
+`dimmedAt()` replaced the inline `hour >= DIM_FROM_HOUR || hour < DIM_UNTIL_HOUR`. That test
+was right only because the window wraps midnight; now that the hours come off the wire it also
+has to handle `from < until` (a daytime window) and `from == until` (never dim), so it
+branches on the order. The defines survive as the values a blank EEPROM starts from.
+
+**Both ends are boundaries on a 0–24 line, not hours of the day**, and the end is half open.
+That is why the range checks accept 24 and not just 23 — in three places, and they have to
+agree: the form filter in `handleSave`, the `>C` handler in `linkSetConfig`, and the sanity
+check in `loadConfig`. Without 24 there is no way to say "dim around the clock" at all: `0`–`23`
+leaves the last hour bright and `0`–`0` lands in the equal case and never dims. 24 is legal at
+the start too, where it reads as the far end and therefore behaves like zero.
 
 **Loop cadence.** With rendering in the ISR, `loop()` itself runs in microseconds. The button
 poll, the idle return and the sensor/RTC timers run on every pass and only gain resolution from
@@ -241,6 +265,76 @@ rising edge (press) stored `millis()`, the falling edge (release) turned it into
 duration, and both branches fired on that falling edge — but it had no debounce, so the chatter
 on release produced several falling edges a few milliseconds apart, each taken for another
 short press. That is why the screens jumped in bursts.
+
+## The ESP-01 link
+
+The ESP-01 is a peripheral on the hardware UART at 9600 baud. It owns nothing on the panel;
+pull it out and the clock behaves exactly as it did before. `Clock_ESP01/Clock_ESP01.ino` runs
+WiFiManager's captive portal, an NTP client, and a small web server for the status and
+settings pages. Credentials need no filesystem — the SDK keeps them itself — and the only
+thing the ESP stores of its own is the time zone string, in emulated EEPROM.
+
+**The transport had to be the hardware UART.** `SoftwareSerial` on one of the free pins
+(D8–D13, A0–A3) is not an option: the Timer1 ISR spends ~38 µs twice every 500 µs, which is a
+third of a bit period at 9600 baud, and `SoftwareSerial` in turn masks interrupts for a whole
+byte, which would stick a display row lit. A second I2C master on the DS3231 bus is not an
+option either — the ESP's I2C is bit-banged with no arbitration, and `loop()` polls the RTC ten
+times a second.
+
+**Frames.** One ASCII line, `\n` terminated, ending in `*` and two hex digits of XOR over
+everything before the `*`. `handleLinkFrame()` drops anything that fails without replying, and
+that is the point of the checksum: the ESP's boot ROM dumps 74880 baud chatter onto this wire
+every time it starts, and none of it may be read as a command.
+
+| Direction | Frame |
+|---|---|
+| ESP → Nano | `>T 2026-09-21 14:03:22`, `>Q`, `>G`, `>C <key> <value>` |
+| Nano → ESP | `<S <date> <time> <tenths °C> <mmHg> <%>`, `<C <from> <until> <period>`, `<K`, `<E`, `<B` |
+
+Three things here are load-bearing:
+
+- **A reply must fit in 64 bytes**, the `HardwareSerial` transmit buffer, of which 63 are
+  usable. What has to fit is a *pair*: the ESP polls readings every 3 s and settings every 30 s,
+  so both replies routinely leave in one pass of `updateLink()` — 40 bytes of `<S` plus 16 of
+  `<C`. That is also why `linkSendStatus()` clamps its three readings: `bme.begin()`'s status is
+  discarded, an absent sensor leaves them NaN, and `int(NaN)` is -32768, which would add six
+  characters a field. Go past 63 and `Serial.print` blocks `loop()` until the wire drains, at
+  about a millisecond a byte.
+- **`>T` is refused while `state >= settings`.** Being overruled mid-edit by a frame off the
+  wire is worse than the drift that waiting costs. The ESP is not told why — it does not track
+  acknowledgements at all, it compares the time the clock reports back with its own and pushes
+  again when they disagree. That one mechanism covers the refusal, a lost frame, and the
+  daylight saving change.
+- **Temperature travels as tenths of a degree, as an integer.** Formatting a float on this chip
+  costs over a kilobyte of flash, and the ESP only divides it back.
+
+**EEPROM.** `dimFromHour`, `dimUntilHour` and `marqueePeriodMinutes` are runtime globals now,
+saved at `CONFIG_ADDRESS` behind a `'K' 'C' 1` signature. A chip without that signature keeps
+the compiled defaults rather than three bytes of `0xFF`. `saveConfig()` uses `EEPROM.update()`,
+so an unchanged form costs no write; a changed byte stalls for ~3.3 ms, but with interrupts on,
+so the panel keeps refreshing through it.
+
+**The ESP is flashed over WiFi, and its FQBN carries the flash layout.** Build it as
+`esp8266:esp8266:generic:eesz=1M`, not plain `generic`: the default `1M64` reserves 64 KB for a
+filesystem this firmware never mounts — credentials live in the SDK's own area and the settings
+in emulated EEPROM — and that reservation comes straight out of the space an update needs. The
+two layouts put `_EEPROM_start` at the same address, so the stored settings survive the switch.
+
+OTA has no default password and refuses to start without one; it is set on the settings page.
+Changing it restarts the module, because `ArduinoOTA::setPassword` silently does nothing once
+`begin()` has run and `begin()` itself returns early when already initialised — so calling
+`startOta()` a second time would appear to work while the old password stayed in force.
+
+The ceiling is half the chip, since the running image and the incoming one are both in flash
+during an update: ~502 KB against the current 393 KB. Past that, OTA fails with nothing to
+explain it. Recovery from a bad image is the portal — `autoConnect` raises `K-Clock` when it
+cannot join — and only an image that crashes earlier than that needs the cable.
+
+**A marquee period of zero turns the marquee off**, and that same guard is what keeps the
+`dt.minute % marqueePeriodMinutes` in `loop()` from dividing by zero. `lastMarqueeMinute` is
+cleared as soon as the minute stops matching, rather than only being overwritten when one does.
+That is what makes a period of sixty work: with a single candidate minute, holding the last
+value would make `dt.minute != lastMarqueeMinute` false for ever after the first run.
 
 ## Known rough edges in the current code
 
