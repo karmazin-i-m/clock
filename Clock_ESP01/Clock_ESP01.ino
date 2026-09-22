@@ -17,6 +17,9 @@
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+#include <ESP8266LLMNR.h>
+#include <ESP8266NetBIOS.h>
 #include <ArduinoOTA.h>
 #include <WiFiManager.h>
 #include <EEPROM.h>
@@ -41,6 +44,13 @@
 
 static const char ApName[] = "K-Clock";
 
+// The name the module answers to once it is on the home network, in three
+// places at once: as the DHCP name the router lists it under, as k-clock.local
+// over mDNS, and as a bare k-clock over LLMNR and NetBIOS. Keep it lowercase
+// and free of anything but letters, digits and hyphens - all three protocols
+// want a plain host label.
+static const char HostName[] = "k-clock";
+
 // The Nano talks at 9600 and nothing about this link is in a hurry: one status
 // exchange every few seconds and a time frame once an hour.
 static const unsigned long LinkBaud = 9600;
@@ -59,6 +69,13 @@ static const unsigned long TimePushMs = 3600000UL;
 static const unsigned long TimeRetryMs = 60000;
 static const unsigned long LinkStaleMs = 15000;
 
+// Long enough to start arduino-cli and let avrdude finish - an upload at 57600
+// takes some fifteen seconds - and short enough that forgetting about it costs
+// one missed status poll rather than an evening of wondering why the page is
+// stale.
+static const unsigned long QuietDefaultSeconds = 30;
+static const unsigned long QuietMaxSeconds = 600;
+
 // How far the clock may be out before it is worth correcting. Wide enough that
 // the second the frame spends in flight is never mistaken for drift.
 static const long TimeToleranceSeconds = 5;
@@ -68,6 +85,17 @@ static const long TimeToleranceSeconds = 5;
 // rather than a constant. Drop the EEST half and leave "EET-2" if the clocks
 // stop changing.
 static const char DefaultTz[] = "EET-2EEST,M3.5.0/3,M10.5.0/4";
+
+// The password OTA starts with. It is in the repository, so be clear about what
+// it is worth: it stops a neighbour who stumbles onto the module, and nothing
+// else. Anyone holding this source can write to a clock on the same network.
+// The alternative was shipping without one, and that turned out worse in
+// practice - a module that arrives with OTA already working can be recovered
+// over the air on the day it is set up, whereas one waiting to be told a
+// password first has to be opened and cabled if anything goes wrong before
+// somebody gets to the form. Set your own on the settings page and this stops
+// applying to your module; the stored one always wins.
+static const char DefaultOtaPassword[] = "k-clock";
 
 // Bumped when the struct grows, so a module carrying the older layout falls
 // back to the defaults instead of reading the new field out of stale bytes.
@@ -93,6 +121,11 @@ bool serverStarted;
 bool timeSynced;
 bool timePushed;
 bool otaReady;
+
+// Rollover safe as a pair, like the clock's own: always a subtraction of two
+// millis() values rather than a stored deadline that wraps.
+unsigned long quietStart;
+unsigned long quietMs;
 bool otaActive;
 
 // Everything last heard from the clock. The web page renders this cache rather
@@ -124,6 +157,9 @@ char linkLine[80];
 uint8_t linkLength;
 bool linkOverflow;
 
+// True while the quiet period has the UART shut down and GPIO1 released.
+bool linkOffline;
+
 // ---------------------------------------------------------------- settings --
 
 void loadSettings() {
@@ -134,10 +170,8 @@ void loadSettings() {
     settings.magic = SettingsMagic;
     strncpy(settings.tz, DefaultTz, sizeof(settings.tz) - 1);
 
-    // No default password. One written here would be in the repository, which
-    // is the same as no password at all, so OTA simply stays down until
-    // somebody sets one on the settings page.
-    settings.otaPassword[0] = '\0';
+    strncpy(settings.otaPassword, DefaultOtaPassword,
+            sizeof(settings.otaPassword) - 1);
   }
 
   // Outside the branch on purpose. A half written commit can leave the magic
@@ -145,11 +179,25 @@ void loadSettings() {
   // touches these afterwards reads them as C strings.
   settings.tz[sizeof(settings.tz) - 1] = '\0';
   settings.otaPassword[sizeof(settings.otaPassword) - 1] = '\0';
+
+  // A module carrying the layout from before there was a default has a valid
+  // magic word and an empty password, so the branch above never runs for it.
+  // Without this it would keep OTA switched off for ever.
+  if (settings.otaPassword[0] == '\0') {
+    strncpy(settings.otaPassword, DefaultOtaPassword,
+            sizeof(settings.otaPassword) - 1);
+  }
 }
 
 void saveSettings() {
   EEPROM.put(0, settings);
   EEPROM.commit();
+}
+
+// Worth showing on the status page: it is the difference between a clock only
+// this repository can write to and one only its owner can.
+bool otaPasswordIsDefault() {
+  return strcmp(settings.otaPassword, DefaultOtaPassword) == 0;
 }
 
 // -------------------------------------------------------------------- link --
@@ -169,7 +217,26 @@ static int hexDigit(char c) {
   return -1;
 }
 
+// The whole point of the quiet period: while it lasts the ESP's transmitter
+// stays off D0, so avrdude has the clock's bootloader to itself. The gate is
+// here rather than at the call sites, so nothing can be added later that talks
+// through it by accident.
+bool linkQuiet() {
+  return quietMs > 0 && millis() - quietStart < quietMs;
+}
+
+unsigned long quietSecondsLeft() {
+  if (!linkQuiet()) {
+    return 0;
+  }
+  return (quietMs - (millis() - quietStart) + 999) / 1000;
+}
+
 void linkSend(const char *payload) {
+  if (linkQuiet()) {
+    return;
+  }
+
   char tail[4];
   snprintf(tail, sizeof(tail), "*%02X", linkChecksum(payload));
   Serial.print(payload);
@@ -255,6 +322,17 @@ void handleLinkFrame(char *line) {
       clockConfig.valid = false;
       timePushed = false;
       break;
+    case 'R':
+      // Ten seconds on the clock's button. The stored network goes, and with it
+      // the only way back in if the router it named no longer exists. Restart
+      // rather than calling autoConnect again from here: this runs inside the
+      // link parser, with a half read buffer and a web request possibly in
+      // flight, and the portal wants a clean start.
+      DBG(F("Network reset from the clock"));
+      wm.resetSettings();
+      delay(100);
+      ESP.restart();
+      break;
     case 'K':
       break;
     case 'E':
@@ -271,6 +349,34 @@ void handleLinkFrame(char *line) {
 }
 
 void updateLink() {
+  // Going quiet is not a matter of saying nothing. GPIO1 is a push-pull output
+  // that idles high, and while it is driving D0 the USB bridge cannot pull that
+  // line low cleanly however silent we are - which is exactly what made the
+  // first version of this useless as a substitute for the jumper. Serial.end()
+  // is what actually steps off the wire: uart_uninit() puts the pin back to
+  // pinMode(1, INPUT), a genuine high impedance.
+  bool quiet = linkQuiet();
+
+  if (quiet && !linkOffline) {
+    Serial.flush();
+    Serial.end();
+    linkOffline = true;
+    linkLength = 0;
+    linkOverflow = false;
+    return;
+  }
+
+  if (!quiet && linkOffline) {
+    Serial.begin(LinkBaud);
+    linkOffline = false;
+    linkLength = 0;
+    linkOverflow = false;
+  }
+
+  if (linkOffline) {
+    return;
+  }
+
   while (Serial.available()) {
     char c = Serial.read();
 
@@ -448,17 +554,36 @@ void handleRoot() {
   page += F("<h2>Мережа</h2>");
   appendRow(page, F("SSID"), WiFi.SSID());
   appendRow(page, F("IP"), WiFi.localIP().toString());
+  appendRow(page, F("Ім'я"), String(F("http://")) + HostName + F(".local/"));
   appendRow(page, F("Сигнал"), String(WiFi.RSSI()) + F(" dBm"));
   appendRow(page, F("Час з NTP"), haveRealTime() ? F("отримано") : F("ще ні"));
   appendRow(page, F("Часовий пояс"), String(settings.tz));
   appendRow(page, F("Оновлення по WiFi"),
-            otaReady ? F("увімкнено") : F("вимкнено — не задано пароль"));
+            !otaReady          ? F("вимкнено")
+            : otaPasswordIsDefault() ? F("увімкнено, пароль типовий")
+                                     : F("увімкнено, пароль власний"));
 
   page += F("<h2>Лінія до Nano</h2>");
   appendRow(page, F("Прийнято кадрів"), String(linkFramesGood));
   appendRow(page, F("Відкинуто"), String(linkFramesDropped));
   appendRow(page, F("Відхилено годинником"), String(linkFramesRejected));
   appendRow(page, F("Аптайм ESP"), String(millis() / 1000) + F(" с"));
+
+  page += F("<h2>Тиша на лінії</h2>");
+
+  if (linkQuiet()) {
+    appendRow(page, F("Стан"),
+              String(F("мовчимо ще ")) + quietSecondsLeft() + F(" с"));
+  } else {
+    appendRow(page, F("Стан"), F("лінія працює"));
+  }
+
+  page += F("<form method=post action='/quiet'>"
+            "<p style='color:#9aa0a6;font-size:.85rem'>Натисніть перед тим, як "
+            "запускати заливку, і одразу запускайте її.</p>"
+            "<button name=target value=esp>Шию Nano — ESP мовчить 30 с</button> "
+            "<button name=target value=nano>Шию ESP кабелем — годинник мовчить "
+            "300 с</button></form>");
 
   page += F("<p><a href='/settings'>Налаштування</a></p></main>");
 
@@ -485,8 +610,8 @@ void handleSettings() {
 
   page += F("<h2>Оновлення по WiFi</h2>");
   page += F("<label>Пароль OTA (порожнє — не змінювати");
-  page += settings.otaPassword[0] ? F("; зараз задано)</label>")
-                                  : F("; зараз не задано, оновлення вимкнене)</label>");
+  page += otaPasswordIsDefault() ? F("; зараз типовий — його видно у прошивці)</label>")
+                                 : F("; зараз власний)</label>");
   page += F("<input name=ota type=password autocomplete=new-password>");
   page += F("<p style='color:#9aa0a6;font-size:.85rem'>Зміна пароля перезавантажує "
             "модуль — бібліотека приймає його лише під час запуску.</p>");
@@ -646,6 +771,69 @@ void handleSave() {
   }
 }
 
+// The two sides of one problem. Flashing the Nano over the cable puts the USB
+// bridge on D0, where the ESP is already transmitting, and the contention
+// corrupts the image - that is what the jumper in the ESP's TX line is for, and
+// this is the way to avoid reaching for it. Flashing the ESP over the cable is
+// the mirror image: the clock's D1 fights the bridge for the ESP's RX, and
+// there the clock is the one that has to hold its tongue, so it is told with a
+// ">M <seconds>" frame while the ESP can still send one.
+//
+// Neither side needs cancelling. Both are timers, and both expire on their own.
+void handleQuiet() {
+  String target = server.arg("target");
+
+  if (target == "nano") {
+    // Lift our own silence first, or the one frame that matters would be the
+    // one thing the gate below swallows.
+    quietMs = 0;
+
+    char frame[16];
+    snprintf(frame, sizeof(frame), ">M %lu", QuietMaxSeconds / 2);
+    linkSend(frame);
+    // Out of the buffer before the browser is answered, since the next thing
+    // that happens is somebody pulling power off the module.
+    Serial.flush();
+  } else {
+    quietStart = millis();
+    quietMs = QuietDefaultSeconds * 1000UL;
+  }
+
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// --------------------------------------------------------------- discovery --// --------------------------------------------------------------- discovery --
+
+// Finding the page on the home network used to mean opening the router and
+// reading its DHCP lease table, because the module announced itself nowhere.
+// It looked as though k-clock.local worked, and sometimes it did - but only by
+// accident: ArduinoOTA::begin() calls MDNS.begin() for its own sake, so the
+// name existed exactly as long as an OTA password did, and advertised
+// _arduino._tcp rather than a web server. This makes it deliberate instead.
+//
+// Three protocols, because no single one covers every client:
+//
+//   mDNS     k-clock.local - iOS, macOS, Windows 10+, Android 12+, Linux with
+//            avahi. The addService call is what also lists the clock among the
+//            HTTP servers a network browser shows.
+//   LLMNR    a bare k-clock from Windows, which asks for it before DNS.
+//   NetBIOS  the same bare name for anything older that still speaks it.
+//
+// None of them reaches an Android older than 12; there the router's lease
+// table, under this same name, is still the answer.
+void startDiscovery() {
+  // Harmless if ArduinoOTA has already brought the responder up - begin() only
+  // sets the hostname and restarts it, and it does not drop services that were
+  // registered beforehand. Ordering it after startOta() keeps the http service
+  // on the near side of that restart either way.
+  MDNS.begin(HostName);
+  MDNS.addService("http", "tcp", 80);
+
+  LLMNR.begin(HostName);
+  NBNS.begin(HostName);
+}
+
 // --------------------------------------------------------------------- ota --
 
 // Over the air updates fit because the sketch is around 370 KB and the 1M
@@ -660,11 +848,14 @@ void handleSave() {
 void startOta() {
   otaReady = false;
 
+  // Unreachable as things stand - loadSettings() never leaves this empty - and
+  // kept because ArduinoOTA accepts an empty password as "no password at all"
+  // rather than refusing, which would quietly open the module to the network.
   if (settings.otaPassword[0] == '\0') {
     return;
   }
 
-  ArduinoOTA.setHostname("k-clock");
+  ArduinoOTA.setHostname(HostName);
   ArduinoOTA.setPassword(settings.otaPassword);
 
   // The Nano is not told anything. It keeps running its own firmware, its
@@ -710,7 +901,7 @@ void setup() {
   loadSettings();
 
   WiFi.mode(WIFI_STA);
-  WiFi.hostname("k-clock");
+  WiFi.hostname(HostName);
 
 #if FORGET_WIFI
   wm.resetSettings();
@@ -740,10 +931,12 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/settings", handleSettings);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/quiet", HTTP_POST, handleQuiet);
 }
 
 void loop() {
   wm.process();
+
   updateLink();
 
   unsigned long now = millis();
@@ -761,6 +954,7 @@ void loop() {
     serverStarted = true;
     startTimeSync();
     startOta();
+    startDiscovery();
     DBG(WiFi.localIP());
   }
 
@@ -775,6 +969,7 @@ void loop() {
   }
 
   if (serverStarted) {
+    MDNS.update();
     server.handleClient();
   }
 

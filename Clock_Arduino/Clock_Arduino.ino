@@ -104,6 +104,17 @@
 #define BUTTON_HOLD_MS 3000
 #define BUTTON_FIELD_HOLD_MS 1000
 
+// Ten seconds, which is deliberately nowhere near the three that open time
+// programming: this is the escape hatch for a router that was replaced, and it
+// throws away a working network, so it must not be reachable by holding a
+// moment too long.
+#define BUTTON_RESET_HOLD_MS 10000
+
+// The longest silence the ESP may ask for. Generous enough to cover walking the
+// module into its bootloader by hand, and short enough that a frame sent by
+// mistake cannot take the clock off the wire for the rest of the day.
+#define LINK_MUTE_MAX_SECONDS 600
+
 // A sensor screen returns to the clock once the button has been left alone this
 // long. Programming is exempt: it is a deliberate mode the user is standing in
 // front of, and dropping out of it mid-edit would be worse than waiting.
@@ -277,6 +288,13 @@ int state = 0;
 bool buttonRaw;
 bool buttonStable;
 bool buttonHoldFired;
+bool buttonResetFired;
+
+// Rollover safe as a pair: the comparison is always a subtraction of two
+// millis() values, never a stored deadline that wraps.
+unsigned long linkMuteStart;
+unsigned long linkMuteMs;
+bool linkOffline;
 unsigned long buttonEdgeTime;
 unsigned long buttonPressTime;
 unsigned long buttonActivityTime;
@@ -796,7 +814,18 @@ void saveConfig(){
   EEPROM.update(CONFIG_ADDRESS + 5, marqueePeriodMinutes);
 }
 
+// Nothing the clock has to say is worth a corrupted image, so the gate sits here
+// rather than at each call site - the boot frame and the ten second reset go
+// through it too.
+static bool linkMuted(){
+  return linkMuteMs > 0 && millis() - linkMuteStart < linkMuteMs;
+}
+
 void linkSend(const char *payload){
+  if(linkMuted()){
+    return;
+  }
+
   uint8_t sum = 0;
   for(const char *p = payload; *p; p++){
     sum ^= (uint8_t)*p;
@@ -968,6 +997,45 @@ static void linkSetConfig(char *args){
   linkSend("<K");
 }
 
+// ">M 300" - the ESP is about to be flashed over the cable, and the clock's D1
+// would be fighting the USB bridge for its RX line the whole time. Everything
+// is digits only and bounded, because the one thing worse than a noisy wire is
+// a clock that has talked itself into silence.
+static void linkMute(const char *args){
+  if(*args != ' '){
+    linkSend("<E");
+    return;
+  }
+
+  args++;
+  long seconds = 0;
+  const char *p = args;
+  if(*p == '\0'){
+    linkSend("<E");
+    return;
+  }
+
+  for(; *p; p++){
+    if(*p < '0' || *p > '9'){
+      linkSend("<E");
+      return;
+    }
+    seconds = seconds * 10 + (*p - '0');
+    if(seconds > LINK_MUTE_MAX_SECONDS){
+      linkSend("<E");
+      return;
+    }
+  }
+
+  // Acknowledged before the gate closes, or the ESP would be left wondering
+  // whether the frame arrived at all.
+  linkSend("<K");
+  Serial.flush();
+
+  linkMuteStart = millis();
+  linkMuteMs = (unsigned long)seconds * 1000UL;
+}
+
 static void handleLinkFrame(char *line){
   // Not addressed to us, so not even worth an error frame - this is where the
   // ESP's boot chatter lands.
@@ -980,6 +1048,7 @@ static void handleLinkFrame(char *line){
     case 'Q': linkSendStatus(); break;
     case 'G': linkSendConfig(); break;
     case 'C': linkSetConfig(line + 2); break;
+    case 'M': linkMute(line + 2); break;
     default:  linkSend("<E"); break;
   }
 }
@@ -988,6 +1057,34 @@ static void handleLinkFrame(char *line){
 // and the hardware buffer holds sixty four of them, so loop() drains it many
 // times over between arrivals and nothing here ever blocks.
 void updateLink(){
+  // Same correction as on the ESP: silence is not enough. D1 is TXD, driven
+  // high by the UART, and while it is driving the ESP's RX no bridge can talk
+  // to that pin cleanly. Clearing TXEN0 - which is what Serial.end() does -
+  // hands the pin back to DDRD, and nothing in this sketch ever made it an
+  // output, so it becomes a high impedance input. pinMode() says so out loud.
+  bool muted = linkMuted();
+
+  if(muted && !linkOffline){
+    Serial.flush();
+    Serial.end();
+    pinMode(1, INPUT);
+    linkOffline = true;
+    linkLength = 0;
+    linkOverflow = false;
+    return;
+  }
+
+  if(!muted && linkOffline){
+    Serial.begin(LINK_BAUD);
+    linkOffline = false;
+    linkLength = 0;
+    linkOverflow = false;
+  }
+
+  if(linkOffline){
+    return;
+  }
+
   while(Serial.available()){
     char c = Serial.read();
 
@@ -1035,6 +1132,7 @@ void updateButton(unsigned long now){
     if(pressed){
       buttonPressTime = now;
       buttonHoldFired = false;
+      buttonResetFired = false;
     }
     else if(!buttonHoldFired){
       buttonClick();
@@ -1050,6 +1148,22 @@ void updateButton(unsigned long now){
       buttonHoldFired = true;
       buttonHold();
     }
+  }
+  
+  // Separate from buttonHoldFired on purpose. That latch has already fired by
+  // now - the longest threshold above is three seconds - so this needs a latch
+  // of its own, and it does not go through buttonHold(), which is per screen.
+  // Ten seconds is the same gesture wherever it starts.
+  if(buttonStable && !buttonResetFired && now - buttonPressTime >= BUTTON_RESET_HOLD_MS){
+    buttonResetFired = true;
+    linkSend("<R");
+    
+    // On the clock screen the three second threshold has already dropped us
+    // into programming on the way past, so leave it - and leave it without
+    // going through endSettings, which would write the half edited digits to
+    // the RTC. Nothing is drawn about the reset: the clock knows only that it
+    // sent a frame, and whether an ESP was even listening is not its business.
+    state = times;
   }
 }
 

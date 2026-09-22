@@ -50,9 +50,11 @@ the single most misleading line in the sketch.
 | Click | next screen | next screen | +1 to the digit |
 | Hold 3 s | enter programming | nothing | — |
 | Hold 1 s | — | — | next field, then save |
+| Hold 10 s | reset the ESP's WiFi | reset the ESP's WiFi | reset the ESP's WiFi |
 | 30 s idle | — | back to the clock | no effect |
 
-A click also aborts a running marquee.
+A click also aborts a running marquee. The ten second hold is the way back to the portal when
+the network the clock was joined to no longer exists — see **WiFi** below.
 
 ## Layout
 
@@ -79,9 +81,28 @@ point called **K-Clock**. Joining it from a phone opens the configuration page b
 way a hotel portal does: the module answers every DNS query with its own address, so the plain
 HTTP probe each OS fires after joining (`connectivitycheck.gstatic.com` for Android,
 `captive.apple.com` for iOS) gets a redirect instead of the reply it expects, and the phone
-concludes it is behind a portal. Pick the network, type the password, done. Afterwards the
-page lives at `http://k-clock/` on the home network and offers the time zone, the dimming
-hours and the marquee period.
+concludes it is behind a portal. Pick the network, type the password, done.
+
+Afterwards the page lives at **`http://k-clock.local/`** on the home network and offers the
+time zone, the dimming hours and the marquee period. Nothing has to be looked up for that: the
+module announces itself under one name through three protocols at once — mDNS for
+`k-clock.local`, which covers iOS, macOS, Windows 10+, Android 12+ and any Linux running
+avahi; LLMNR and NetBIOS for a bare `http://k-clock/` from Windows; and the same name as its
+DHCP hostname, so the router lists it that way too. The mDNS record also advertises the web
+server itself, so the clock turns up in whatever browses services on the network.
+
+An Android older than 12 resolves none of these. There the router's lease table, under that
+same `k-clock`, is where the address is — and it is worth pinning to the MAC while you are in
+there anyway.
+
+**Getting back to the portal.** Hold the clock's button for ten seconds. The clock sends `<R`,
+the ESP forgets the stored network and restarts, and `K-Clock` comes back up. This is the
+answer to the one failure the module cannot talk its way out of — a router that was replaced,
+or a password that changed — where it can neither join the network nor be reached on it. Ten
+seconds is far past the three that open time programming, so it cannot be hit by accident; if
+the hold does pass through programming on the way, it is abandoned without writing anything to
+the RTC. Nothing is shown on the panel about any of this. The ESP's own LED going back to fast
+blinking is the confirmation.
 
 The two boards talk in one-line ASCII frames ending in a XOR checksum. The checksum is not
 there for noisy wires — it is there because the ESP's boot ROM dumps a burst of 74880 baud
@@ -94,9 +115,11 @@ command. Frames that fail are dropped without a reply.
 | ESP → Nano | `>Q` | ask for the readings |
 | ESP → Nano | `>G` | ask for the settings |
 | ESP → Nano | `>C dimfrom 22` | change one setting |
+| ESP → Nano | `>M 300` | stay off the wire for this many seconds |
 | Nano → ESP | `<S 2026-09-21 14:03:22 234 745 57` | date, time, tenths of a degree, mmHg, percent |
 | Nano → ESP | `<C 22 7 5` | dim from, dim until, marquee period |
 | Nano → ESP | `<K` / `<E` / `<B` | accepted / rejected / the clock just booted |
+| Nano → ESP | `<R` | forget the network and restart — the button was held ten seconds |
 
 Settings changed over the link are kept in the Nano's EEPROM, which the firmware had not used
 at all before. A blank chip falls back to the compiled defaults.
@@ -110,6 +133,26 @@ module. `CH_PD` and `GPIO2` want 10k pull-ups, `GPIO0` a 10k pull-up and a butto
 **Put a jumper in the ESP TX line.** `arduino-cli upload` drives D0 from the USB bridge, and an
 ESP transmitting at the same moment corrupts the flash. The boot banner is gone for the same
 reason: `setup()` now sends a `<B` frame instead of printing `Initialized`.
+
+**Or take the wire out of the argument from the browser.** The status page has two buttons for
+the two halves of that problem, and they do save reaching into the case — verified by flashing
+the Nano with the ESP still wired in:
+
+- *Шию Nano* takes the ESP off the line for 30 seconds, long enough to start `arduino-cli` and
+  let an upload at 57600 finish, so avrdude has the clock's bootloader to itself.
+- *Шию ESP кабелем* is the mirror image, for when the module is being walked into its own
+  bootloader by hand: the clock's D1 would otherwise fight the bridge for the ESP's RX, so the
+  ESP sends `>M 300` while it still can and the clock holds its tongue for five minutes.
+
+**Saying nothing is not enough, and this is the part that matters.** A UART transmit pin is a
+push-pull output that idles high, so a silent ESP still drives D0 and the USB bridge still
+cannot pull that line low cleanly. Both sides therefore shut the UART down rather than merely
+stop writing to it: `Serial.end()` on the ESP hands GPIO1 back as a high-impedance input, and
+on the Nano it clears `TXEN0`, which returns D1 to a `DDRD` bit nothing ever set. The first
+version of this only stopped the data, and it did not work.
+
+Neither side needs cancelling — both are plain timers, and the clock caps anything asked of it
+at ten minutes so a stray frame cannot talk it into silence for the rest of the day.
 
 ## Building and flashing
 
@@ -138,13 +181,27 @@ building before esptool starts, and the module can fall out of the window.
 ### Updating the ESP over WiFi
 
 Once a module is running this firmware, the cable is only needed again if an update bricks it.
-Set an OTA password on the settings page — there is no default, and the service stays down
-until there is one, because a password in the repository would protect nothing. Then:
+OTA is on from the first boot, with the password `k-clock`:
 
 ```bash
-arduino-cli compile --fqbn esp8266:esp8266:generic:eesz=1M --clean --upload \
-  -p 192.168.1.102 --upload-field password=<the one you set> Clock_ESP01/Clock_ESP01.ino
+arduino-cli compile --fqbn esp8266:esp8266:generic:eesz=1M --clean Clock_ESP01/Clock_ESP01.ino
+arduino-cli upload  --fqbn esp8266:esp8266:generic:eesz=1M \
+  -p k-clock.local -F password=k-clock Clock_ESP01/Clock_ESP01.ino
 ```
+
+Two commands, not one: `-F/--upload-field` is a flag of `upload` alone, and `compile --upload`
+rejects it outright with `unknown flag`. That is the one place the warning about never
+uploading a build you did not just produce has to be set aside — there is no way to pass the
+password otherwise, so compile immediately before, into the default cache, and upload straight
+after.
+
+That password is in this repository, so be clear about what it buys: it keeps a neighbour who
+stumbles onto the module out, and nothing more — anyone holding this source can write to a
+clock on the same network. Set your own on the settings page and it stops applying to your
+module; the stored one always wins, and the status page says which of the two is in force.
+The trade was made on purpose: a module that ships with OTA working can be rescued over the
+air the day it is set up, whereas one waiting to be told a password has to be opened and
+cabled if anything goes wrong before somebody reaches the form.
 
 Changing the password reboots the module. That is not tidiness: `ArduinoOTA::setPassword`
 returns without storing anything once `begin()` has run, so a new one can only be applied by
@@ -153,7 +210,7 @@ stayed in force.
 
 **Mind the headroom.** Both the running image and the incoming one have to be in flash at
 once, which puts the ceiling at half the chip — about 502 KB on this layout, against an image
-of 393 KB. Grow the sketch past that and OTA stops working with no warning beyond a failed
+of 400 KB. Grow the sketch past that and OTA stops working with no warning beyond a failed
 upload. An image that merely fails to join the network is still recoverable without the cable:
 `autoConnect` raises `K-Clock` and waits. Only one that crashes before reaching that line
 needs opening the case.
@@ -192,10 +249,10 @@ the marquee runs four pages instead of five.
 
 |  | Flash | SRAM |
 |---|---|---|
-| BME280 | 20236 B (65%) | 900 B (43%) |
-| BMP280 | 19500 B (63%) | 894 B (43%) |
+| BME280 | 20740 B (67%) | 914 B (44%) |
+| BMP280 | 20014 B (65%) | 906 B (44%) |
 
-The ESP-01 build is 339 KB of its 1 MB, and needs no filesystem: the SDK keeps the WiFi
+The ESP-01 build is 400 KB of its 1 MB, and needs no filesystem: the SDK keeps the WiFi
 credentials in its own flash area and the only other stored setting, the time zone, fits in
 the emulated EEPROM.
 

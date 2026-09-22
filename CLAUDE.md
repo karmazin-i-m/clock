@@ -71,7 +71,8 @@ seconds. Failing that, poke it: send `>Q*` with a valid checksum and a `<S` fram
 
 **Unplug the ESP before flashing the Nano.** `arduino-cli upload` drives D0 from the USB
 bridge; an ESP transmitting into the same pin corrupts the upload. This is what the jumper in
-the ESP TX line is for.
+the ESP TX line is for - or press the status page's first quiet button and start the upload
+straight away, which does the same thing without opening anything. See the link section.
 
 Libraries: `Wire`, `Adafruit_Sensor`, `Adafruit_BME280`, `Adafruit_BMP280`, and Jarzebski's
 `DS3231` — the one exposing `RTCDateTime`, which is not in the library index and is installed
@@ -103,7 +104,7 @@ With `HAS_HUMIDITY 0` the sensor class becomes `Adafruit_BMP280`, and the humidi
 dropped rather than rendered as a literal `00%`: `MARQUEE_PAGE_COUNT` falls to 4 and `case
 humidity` disappears, so the button cycle runs clock → temperature → pressure → clock through
 the existing `default` reset. Verify both configurations compile after touching display code;
-as of the ESP link they are 20236 and 19500 bytes of flash. The variant also reaches the wire:
+as of the ESP link they are 20740 and 20014 bytes of flash. The variant also reaches the wire:
 `linkSendStatus()` sends `-1` for humidity on a BMP280 board, and the ESP's page renders that
 as "no sensor" rather than as a reading.
 
@@ -288,8 +289,8 @@ every time it starts, and none of it may be read as a command.
 
 | Direction | Frame |
 |---|---|
-| ESP → Nano | `>T 2026-09-21 14:03:22`, `>Q`, `>G`, `>C <key> <value>` |
-| Nano → ESP | `<S <date> <time> <tenths °C> <mmHg> <%>`, `<C <from> <until> <period>`, `<K`, `<E`, `<B` |
+| ESP → Nano | `>T 2026-09-21 14:03:22`, `>Q`, `>G`, `>C <key> <value>`, `>M <seconds>` |
+| Nano → ESP | `<S <date> <time> <tenths °C> <mmHg> <%>`, `<C <from> <until> <period>`, `<K`, `<E`, `<B`, `<R` |
 
 Three things here are load-bearing:
 
@@ -299,7 +300,11 @@ Three things here are load-bearing:
   `<C`. That is also why `linkSendStatus()` clamps its three readings: `bme.begin()`'s status is
   discarded, an absent sensor leaves them NaN, and `int(NaN)` is -32768, which would add six
   characters a field. Go past 63 and `Serial.print` blocks `loop()` until the wire drains, at
-  about a millisecond a byte.
+  about a millisecond a byte. `<R` is the one frame allowed to break this, and only because it
+  cannot be made to collide often enough to matter: seven bytes on top of the 57 byte pair is
+  64, one over, on the single pass where a ten second hold coincides with both polls. The cost
+  is a millisecond of blocking on the rarest event the clock has, and the panel is on the ISR,
+  so nothing is visible. Do not take it as licence to add a fifth frame.
 - **`>T` is refused while `state >= settings`.** Being overruled mid-edit by a frame off the
   wire is worse than the drift that waiting costs. The ESP is not told why — it does not track
   acknowledgements at all, it compares the time the clock reports back with its own and pushes
@@ -308,27 +313,87 @@ Three things here are load-bearing:
 - **Temperature travels as tenths of a degree, as an integer.** Formatting a float on this chip
   costs over a kilobyte of flash, and the ESP only divides it back.
 
+**The ten second hold resets the ESP's network.** `updateButton()` carries a second latch,
+`buttonResetFired`, independent of `buttonHoldFired` — which has necessarily already fired by
+then, since the longest threshold above it is three seconds — and it does not go through
+`buttonHold()`, because that dispatches per screen and this gesture means the same thing
+everywhere. It sends `<R` and drops `state` back to `times`: on the clock screen the three
+second threshold has already opened programming on the way past, and leaving through
+`endSettings` would write the half edited digits to the RTC. The ESP answers it by calling
+`wm.resetSettings()` and restarting rather than re-entering the portal in place, since the
+handler runs inside the link parser with a half read buffer and possibly a web request in
+flight. Nothing is drawn on the panel: the clock knows only that it sent a frame, and whether
+an ESP was listening is not its business.
+
 **EEPROM.** `dimFromHour`, `dimUntilHour` and `marqueePeriodMinutes` are runtime globals now,
 saved at `CONFIG_ADDRESS` behind a `'K' 'C' 1` signature. A chip without that signature keeps
 the compiled defaults rather than three bytes of `0xFF`. `saveConfig()` uses `EEPROM.update()`,
 so an unchanged form costs no write; a changed byte stalls for ~3.3 ms, but with interrupts on,
 so the panel keeps refreshing through it.
 
+**The module announces itself, rather than being looked up.** `startDiscovery()` brings up
+mDNS, LLMNR and NetBIOS on one name, `HostName` — `k-clock.local` for everything modern,
+a bare `k-clock` for Windows, and `MDNS.addService("http", "tcp", 80)` so the web server is
+advertised and not only the host. It exists because the name used to be an accident:
+`ArduinoOTA::begin()` calls `MDNS.begin()` for its own purposes, so `k-clock.local` resolved
+exactly as long as an OTA password was set and advertised `_arduino._tcp` rather than a web
+server. `loop()` calls `MDNS.update()` itself for the same reason, even though
+`ArduinoOTA.handle()` also does — that coupling is what the change removes. `startDiscovery()`
+runs after `startOta()` so the http service is registered on the near side of the responder
+restart that `ArduinoOTA::begin()` triggers; `MDNS.begin()` twice is safe, it sets the hostname
+and restarts without dropping registered services.
+
 **The ESP is flashed over WiFi, and its FQBN carries the flash layout.** Build it as
 `esp8266:esp8266:generic:eesz=1M`, not plain `generic`: the default `1M64` reserves 64 KB for a
 filesystem this firmware never mounts — credentials live in the SDK's own area and the settings
 in emulated EEPROM — and that reservation comes straight out of the space an update needs. The
 two layouts put `_EEPROM_start` at the same address, so the stored settings survive the switch.
+An OTA upload takes two commands, because `-F/--upload-field` belongs to `upload` and
+`compile --upload` refuses it with `unknown flag` - compile into the default cache, then upload
+straight after.
 
-OTA has no default password and refuses to start without one; it is set on the settings page.
-Changing it restarts the module, because `ArduinoOTA::setPassword` silently does nothing once
+OTA starts with the compiled-in `DefaultOtaPassword`, `k-clock`, which `loadSettings()` writes
+into a fresh EEPROM and also fills in for a module whose stored password is empty — that is a
+module flashed back when there was no default, whose magic word is valid so the fresh-EEPROM
+branch never runs for it. A password set on the settings page overrides it, and
+`otaPasswordIsDefault()` is what both pages use to say which is in force. The guard in
+`startOta()` is now unreachable and stays because `ArduinoOTA` treats an empty password as no
+password rather than as a refusal. Changing the password restarts the module, because `ArduinoOTA::setPassword` silently does nothing once
 `begin()` has run and `begin()` itself returns early when already initialised — so calling
 `startOta()` a second time would appear to work while the old password stayed in force.
 
 The ceiling is half the chip, since the running image and the incoming one are both in flash
-during an update: ~502 KB against the current 393 KB. Past that, OTA fails with nothing to
+during an update: ~502 KB against the current 400 KB. Past that, OTA fails with nothing to
 explain it. Recovery from a bad image is the portal — `autoConnect` raises `K-Clock` when it
 cannot join — and only an image that crashes earlier than that needs the cable.
+
+**Going quiet means leaving the wire, not just stopping the data.** This is the whole point and
+it was got wrong once: a UART transmit pin is a push-pull output idling high, so an ESP that
+has merely stopped writing is still driving D0, and `arduino-cli upload` still fails with `not
+in sync`. Both sides shut the UART down instead. On the ESP `Serial.end()` reaches
+`uart_uninit()`, which does `pinMode(1, INPUT)`; on the Nano it clears `TXEN0`, handing D1 back
+to a `DDRD` bit that nothing in this sketch ever sets, and `pinMode(1, INPUT)` says so out
+loud. `linkOffline` on each side tracks whether the UART is currently down, and `updateLink()`
+reconciles it against the timer on every pass, so the port comes back by itself. Proven by
+flashing the Nano over USB with the ESP still connected and the jumper still in.
+
+**Silence is a timer on each side, never a latch.** `linkQuiet()` on the ESP and `linkMuted()`
+on the Nano are the same two lines - `ms > 0 && millis() - start < ms` - which is subtraction
+of two live `millis()` values rather than a stored deadline, so neither can be stranded by the
+rollover. Both gates sit inside `linkSend()` rather than at the call sites, so nothing added
+later talks through them by accident; on the Nano that deliberately covers `<B` and `<R` too.
+The ESP additionally drains its receiver without parsing while quiet, so `linkFramesDropped`
+keeps meaning "chatter that arrived when the clock should have been answering" rather than
+counting avrdude.
+
+The two directions are two halves of one problem, and the status page has a button for each.
+Muting the ESP is local - the transmitter comes off D0 and avrdude has the clock's bootloader
+to itself. Muting the Nano has to be sent, as `>M <seconds>`, while the ESP still can; the
+handler clears the ESP's own quiet period first, or the one frame that matters would be the
+one the gate swallows. `LINK_MUTE_MAX_SECONDS` is ten minutes, and `linkMute()` validates
+digit by digit and refuses with `<E` rather than clamping, because a clock that has talked
+itself into silence is worse than a noisy wire. The `<K` goes out and is flushed before the
+gate closes.
 
 **A marquee period of zero turns the marquee off**, and that same guard is what keeps the
 `dt.minute % marqueePeriodMinutes` in `loop()` from dividing by zero. `lastMarqueeMinute` is
