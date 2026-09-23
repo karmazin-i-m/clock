@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Threading.RateLimiting;
 using KClock.Api;
 using KClock.Api.Accounts;
 using KClock.Api.Devices;
@@ -87,12 +88,17 @@ builder.Services.AddRateLimiter(options =>
 {
     // 10/min/IP on enrollment (DESIGN.md §5.1) — RemoteIpAddress is only correct once
     // ForwardedHeaders has already run, which UseForwardedHeaders below guarantees.
-    options.AddFixedWindowLimiter("enroll", limiterOptions =>
-    {
-        limiterOptions.PermitLimit = 10;
-        limiterOptions.Window = TimeSpan.FromMinutes(1);
-        limiterOptions.QueueLimit = 0;
-    });
+    // Partitioned by client address: AddFixedWindowLimiter would be one window shared by
+    // every caller, i.e. 10 enrolments a minute for the whole fleet, and one noisy client
+    // could lock everybody else out.
+    options.AddPolicy("enroll", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 10,
+            Window = TimeSpan.FromMinutes(1),
+            QueueLimit = 0,
+        }));
 
     options.OnRejected = async (context, ct) =>
     {
@@ -110,6 +116,9 @@ var app = builder.Build();
 app.UseForwardedHeaders();
 app.UseAuthentication();
 app.UseAuthorization();
+
+// Without this, RequireRateLimiting("enroll") below is metadata that nothing reads.
+app.UseRateLimiter();
 
 // Unauthenticated, no DB round trip — liveness only.
 app.MapGet("/health/live", () => Results.Ok(new { status = "ok" }));

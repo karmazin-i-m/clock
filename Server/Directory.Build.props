@@ -4,6 +4,10 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- MSB3277 (conflicting assembly versions) is not a compiler warning, so
+         TreatWarningsAsErrors alone lets it through; it is also exactly the warning that
+         shipped an API unable to load EF Core Relational. -->
+    <MSBuildWarningsAsErrors>$(MSBuildWarningsAsErrors);MSB3277</MSBuildWarningsAsErrors>
     <AnalysisLevel>latest</AnalysisLevel>
     <IsPackable>false</IsPackable>
     <InvariantGlobalization>true</InvariantGlobalization>

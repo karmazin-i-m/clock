@@ -44,12 +44,18 @@ public static class GoogleAuthEndpoints
         var email = principal.FindFirstValue(ClaimTypes.Email);
         var name = principal.FindFirstValue(ClaimTypes.Name);
 
-        var accountId = await db.Database
-            .SqlQueryRaw<Guid>(
-                "SELECT find_or_create_account({0}, {1}, {2}, {3})",
-                "google", subject, (object?)email ?? DBNull.Value, (object?)name ?? DBNull.Value)
-            .SingleAsync();
+        var accountId = await FindOrCreateAccountAsync(db, "google", subject, email, name);
 
         ((ClaimsIdentity)principal.Identity!).AddClaim(new Claim(AccountClaimTypes.AccountId, accountId.ToString()));
     }
+
+    public static Task<Guid> FindOrCreateAccountAsync(
+        ClockDbContext db, string provider, string subject, string? email, string? name, CancellationToken ct = default) =>
+        db.Database
+            .SqlQueryRaw<Guid>(
+                // SqlQueryRaw<scalar> composes as SELECT s."Value" FROM (...) s, so the
+                // column must be named Value or the query fails.
+                """SELECT find_or_create_account({0}, {1}, {2}, {3}) AS "Value" """,
+                provider, subject, (object?)email ?? DBNull.Value, (object?)name ?? DBNull.Value)
+            .SingleAsync(ct);
 }

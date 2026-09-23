@@ -54,14 +54,32 @@ SELECT job_id, proc_name, owner, scheduled, config FROM timescaledb_information.
 (expect: compression job `scheduled = true`, retention job `scheduled = false`, aggregate
 refresh jobs `scheduled = true`.)
 
-`dotnet test` here fails all four isolation tests and all four contract tests with a clean
-"Docker not available" error raised inside each test's own `PostgresFixture.InitializeAsync`
-— that is the expected, documented failure mode in this sandbox (see that fixture's doc
-comment), not a bug. `KClock.Tests` is a representative subset of DESIGN.md §13's full case
-list, not the exhaustive one — extending `Contract/DeviceContractTests.cs` and
-`Isolation/TransferIsolationTests.cs` with the remaining enumerated cases (out-of-order batch,
-future timestamp, all-samples-out-of-window) is straightforward follow-up work once there is a
-machine to actually run them on.
+Without Docker, every test fails inside `PostgresFixture.InitializeAsync` with "Docker not
+available". That is expected (see the fixture's doc comment).
+
+**With Docker (.NET 10.0.401, Docker 29.8.1), `dotnet test Server/KClock.slnx` passes all 16
+tests.** The first run against a real database found six defects the Docker-less sandbox could
+not see. All six are fixed, and each has a regression test that fails when the fix is removed:
+
+- EF Core 10.0.12 was resolved against Relational 10.0.4. Every query failed at runtime with
+  `FileNotFoundException`, while the build only raised warning MSB3277, which is now an error.
+- `INSERT ... ON CONFLICT` on the hypertable needs `SELECT` as well as `INSERT`, so
+  `clock_ingest` now has both.
+- `SqlQueryRaw<scalar>` needs its column aliased `"Value"`. Without the alias, Google sign-in
+  failed.
+- `current_account_id()` threw on a pooled connection, because once a scoped transaction has
+  ended the GUC reads `''` rather than NULL. It now uses `NULLIF`.
+- Humidity outside 0–100, or a missing `samples` field, produced a 500. The device retries a
+  500 for ever (§5.3). Humidity outside 0–100 is now stored as NULL, and a batch without
+  `samples` gets a 400.
+- The enrolment rate limit was never applied (`UseRateLimiter` was missing), and the limiter
+  was one window shared by every caller. It is now 10 per minute per client IP.
+
+`ResponseBudgetFilter` also used to write the body itself and return null. The endpoint then
+tried to write a second response, so every `/d/v1` request ended in an unhandled exception and
+a dropped connection. It now returns an `IResult`.
+
+`KClock.Tests` is still a subset of the cases DESIGN.md §13 lists.
 
 ## What you need to supply before any of this works end to end
 

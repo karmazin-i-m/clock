@@ -13,6 +13,11 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
+    <!-- Pinned to the same version as Microsoft.EntityFrameworkCore in KClock.Api. Npgsql
+         10.0.3 only asks for Relational 10.0.4, and a 10.0.12 core against a 10.0.4
+         Relational fails at runtime with FileNotFoundException on the first query, while
+         the build only warns (MSB3277). -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.12" />
   </ItemGroup>
 
 </Project>

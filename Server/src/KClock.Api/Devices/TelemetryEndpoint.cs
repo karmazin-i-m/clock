@@ -17,11 +17,18 @@ public static class TelemetryEndpoint
 {
     private const short TemperatureSentinel = -999;
     private const short PressureSentinel = -1;
-    private const short HumiditySentinel = -1;
 
     public static async Task<DeviceResult> HandleAsync(
         ClaimsPrincipal user, TelemetryRequest request, IngestDbContext db, TimeProvider clock, CancellationToken ct)
     {
+        // System.Text.Json does not enforce non-nullable annotations, so a body without
+        // "samples" arrives as null. Left alone it becomes a NullReferenceException and a 500,
+        // which the device must keep and retry — a poison batch wedging the ring (§5.3).
+        if (request.Samples is null)
+        {
+            return DeviceResult.BadRequest();
+        }
+
         var deviceId = long.Parse(user.FindFirstValue(DeviceClaimTypes.DeviceId)!);
 
         var device = await db.Devices.SingleOrDefaultAsync(d => d.Id == deviceId, ct);
@@ -44,7 +51,7 @@ public static class TelemetryEndpoint
                 ts,
                 Scrub(sample.Tc, TemperatureSentinel),
                 Scrub(sample.P, PressureSentinel),
-                Scrub(sample.H, HumiditySentinel)));
+                ScrubHumidity(sample.H)));
         }
 
         if (inWindow.Count == 0 && request.Samples.Count > 0)
@@ -80,4 +87,9 @@ public static class TelemetryEndpoint
     }
 
     private static short? Scrub(short? value, short sentinel) => value == sentinel ? null : value;
+
+    // Anything outside 0-100 would trip the humidity CHECK and turn the whole batch into a
+    // 500 the device retries for ever (§5.3). The -1 sentinel is one case of this; a sensor
+    // glitch reading 101 is another. Both mean "no valid reading", so both become NULL.
+    private static short? ScrubHumidity(short? value) => value is >= 0 and <= 100 ? value : null;
 }

@@ -28,11 +28,15 @@ namespace KClock.Data.Migrations
         {
             // --- current_account_id(): the one place app.account_id is read back. STABLE, ---
             // --- never IMMUTABLE (§15 review item 4) — the GUC changes within a session.   ---
+            // The NULLIF is load-bearing: missing_ok yields NULL only on a connection that has
+            // never seen the GUC. Once a set_config(..., true) transaction has ended, the
+            // pooled connection reports '' instead, and ''::uuid throws — an exception where
+            // DESIGN.md §8 demands zero rows.
             migrationBuilder.Sql(
                 """
                 CREATE FUNCTION current_account_id() RETURNS uuid
                 LANGUAGE sql STABLE AS $$
-                    SELECT current_setting('app.account_id', true)::uuid
+                    SELECT NULLIF(current_setting('app.account_id', true), '')::uuid
                 $$;
                 """);
 
@@ -203,7 +207,11 @@ namespace KClock.Data.Migrations
                 GRANT SELECT, UPDATE ON enrollment_code TO clock_ingest;
                 GRANT SELECT, INSERT, UPDATE ON device_credential TO clock_ingest;
                 GRANT SELECT, INSERT, UPDATE ON device_state TO clock_ingest;
-                GRANT INSERT ON telemetry TO clock_ingest;
+                -- SELECT as well as INSERT: TimescaleDB refuses INSERT ... ON CONFLICT on a
+                -- hypertable without it ("permission denied for table telemetry"), and the
+                -- ingest statement is ON CONFLICT DO NOTHING by design (DESIGN.md §5.4).
+                -- clock_app still holds nothing on telemetry.
+                GRANT SELECT, INSERT ON telemetry TO clock_ingest;
                 """);
         }
 

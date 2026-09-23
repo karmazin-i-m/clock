@@ -1,8 +1,10 @@
+using KClock.Api.Accounts;
 using KClock.Data;
 using KClock.Data.Entities;
 using KClock.Data.Ingest;
 using KClock.Tests.Fixtures;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 using Xunit;
 
 namespace KClock.Tests.Isolation;
@@ -58,8 +60,60 @@ public class TransferIsolationTests(PostgresFixture fixture)
             .ToList();
         Assert.Equal(5, await writer.InsertAsync(device.Id, samplesB));
 
-        Assert.Equal(5, await CountTelemetryByAccountAsync(accountA));
-        Assert.Equal(5, await CountTelemetryByAccountAsync(accountB));
+        // Each account sees exactly its own five, and the two sets are disjoint (DESIGN.md §13).
+        var seenByA = await TimestampsByAccountAsync(accountA);
+        var seenByB = await TimestampsByAccountAsync(accountB);
+        Assert.Equal(samplesA.Select(x => x.Ts.ToUnixTimeSeconds()).Order(), seenByA);
+        Assert.Equal(samplesB.Select(x => x.Ts.ToUnixTimeSeconds()).Order(), seenByB);
+        Assert.Empty(seenByA.Intersect(seenByB));
+    }
+
+    [Fact]
+    public async Task PooledConnection_AfterScopedTransaction_ReturnsZeroRows_DoesNotThrow()
+    {
+        var accountId = Guid.NewGuid();
+        await SeedAccountAsync(accountId);
+
+        // One physical connection, used the way the pool reuses it: a request sets the GUC
+        // inside its transaction and commits, and the next user of the connection runs
+        // without one. The GUC now reads '' rather than NULL, which must still mean
+        // "nobody" and not an invalid-uuid exception (DESIGN.md §8).
+        await using var conn = new NpgsqlConnection(fixture.AppConnectionString);
+        await conn.OpenAsync();
+        await using (var tx = await conn.BeginTransactionAsync())
+        {
+            await using var set = new NpgsqlCommand("SELECT set_config('app.account_id', @id, true)", conn, tx);
+            set.Parameters.AddWithValue("id", accountId.ToString());
+            await set.ExecuteNonQueryAsync();
+            await tx.CommitAsync();
+        }
+
+        foreach (var sql in new[]
+                 {
+                     "SELECT count(*) FROM telemetry_by_account",
+                     "SELECT count(*) FROM telemetry_1h_by_account",
+                     "SELECT count(*) FROM device",
+                     "SELECT count(*) FROM account",
+                 })
+        {
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            Assert.Equal(0L, await cmd.ExecuteScalarAsync());
+        }
+    }
+
+    [Fact]
+    public async Task GoogleSignIn_FindOrCreateAccount_IsStableForOneSubject()
+    {
+        // The sign-in callback's exact call, as clock_app with no GUC set — the state it runs in.
+        await using var db = CreateAppDbContext();
+        var subject = $"google-{Guid.NewGuid():N}";
+
+        var first = await GoogleAuthEndpoints.FindOrCreateAccountAsync(db, "google", subject, "a@example.test", "A");
+        var second = await GoogleAuthEndpoints.FindOrCreateAccountAsync(db, "google", subject, "a@example.test", "A");
+        var other = await GoogleAuthEndpoints.FindOrCreateAccountAsync(db, "google", $"{subject}-2", null, null);
+
+        Assert.Equal(first, second);
+        Assert.NotEqual(first, other);
     }
 
     [Fact]
@@ -70,7 +124,9 @@ public class TransferIsolationTests(PostgresFixture fixture)
         // Deliberately not calling SetCurrentAccountAsync — the fail-safe DESIGN.md §8
         // requires: an unset GUC must yield zero rows, never everything and never an
         // exception.
-        var count = await app.Database.SqlQueryRaw<int>("SELECT count(*)::int FROM telemetry_by_account").SingleAsync();
+        var count = await app.Database
+            .SqlQueryRaw<int>("""SELECT count(*)::int AS "Value" FROM telemetry_by_account""")
+            .SingleAsync();
         Assert.Equal(0, count);
     }
 
@@ -144,12 +200,16 @@ public class TransferIsolationTests(PostgresFixture fixture)
         await db.SaveChangesAsync();
     }
 
-    private async Task<int> CountTelemetryByAccountAsync(Guid accountId)
+    // SqlQueryRaw<scalar> composes as SELECT s."Value" FROM (...) s, hence the aliases.
+    private async Task<long[]> TimestampsByAccountAsync(Guid accountId)
     {
         await using var db = CreateAppDbContext();
         await using var tx = await db.Database.BeginTransactionAsync();
         await db.SetCurrentAccountAsync(accountId);
-        return await db.Database.SqlQueryRaw<int>("SELECT count(*)::int FROM telemetry_by_account").SingleAsync();
+        return await db.Database
+            .SqlQueryRaw<long>("""SELECT floor(extract(epoch FROM ts))::bigint AS "Value" FROM telemetry_by_account""")
+            .OrderBy(x => x)
+            .ToArrayAsync();
     }
 
     private async Task<int> CountHourlyBucketsByAccountAsync(Guid accountId)
@@ -157,7 +217,9 @@ public class TransferIsolationTests(PostgresFixture fixture)
         await using var db = CreateAppDbContext();
         await using var tx = await db.Database.BeginTransactionAsync();
         await db.SetCurrentAccountAsync(accountId);
-        return await db.Database.SqlQueryRaw<int>("SELECT count(*)::int FROM telemetry_1h_by_account").SingleAsync();
+        return await db.Database
+            .SqlQueryRaw<int>("""SELECT count(*)::int AS "Value" FROM telemetry_1h_by_account""")
+            .SingleAsync();
     }
 
     private ClockDbContext CreateAppDbContext()

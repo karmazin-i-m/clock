@@ -55,7 +55,9 @@ public class DeviceContractTests(PostgresFixture fixture) : IDisposable
         var token = await EnrollAsync(code, mac);
 
         var now = DateTimeOffset.UtcNow;
-        var ts = Enumerable.Range(0, 6).Select(i => now.AddSeconds(-60 + (i * 10)).ToUnixTimeSeconds()).ToArray();
+        // After enrolment, not before: a sample older than the binding belongs to nobody and is
+        // discarded by design (DESIGN.md §9), so pre-enrolment timestamps would test nothing.
+        var ts = Enumerable.Range(0, 6).Select(i => now.AddSeconds(1 + (i * 10)).ToUnixTimeSeconds()).ToArray();
         var requestJson = await LoadFixtureAsync(
             "telemetry_request.json",
             ("__TS0__", ts[0].ToString()), ("__TS1__", ts[1].ToString()), ("__TS2__", ts[2].ToString()),
@@ -94,6 +96,127 @@ public class DeviceContractTests(PostgresFixture fixture) : IDisposable
             new StringContent("""{"seq":1,"cfgv":0,"samples":[]}""", Encoding.UTF8, "application/json"));
 
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+        // And the first binding is closed, not merely orphaned: exactly one open binding,
+        // the old one stamped with why it ended (DESIGN.md §5.1).
+        await using var conn = new NpgsqlConnection(fixture.MigratorConnectionString);
+        await conn.OpenAsync();
+        await using var cmd = new NpgsqlCommand(
+            """
+            SELECT count(*) FILTER (WHERE b.unbound_at IS NULL),
+                   count(*) FILTER (WHERE b.unbound_reason = 're-enrolled')
+            FROM device_binding b JOIN device d ON d.id = b.device_id
+            WHERE d.hardware_id = @mac
+            """,
+            conn);
+        cmd.Parameters.AddWithValue("mac", mac);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(1L, reader.GetInt64(0));
+        Assert.Equal(1L, reader.GetInt64(1));
+    }
+
+    [Fact]
+    public async Task Telemetry_OutOfOrderBatch_IsAcceptedWhole()
+    {
+        var client = await EnrolledClientAsync();
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + 1;
+
+        var result = await PostTelemetryAsync(
+            client,
+            $$"""{"seq":1,"cfgv":0,"samples":[{"ts":{{now + 20}},"tc":1},{"ts":{{now}},"tc":2},{"ts":{{now + 10}},"tc":3}]}""");
+
+        Assert.Equal(3, result.GetProperty("accepted").GetInt32());
+        Assert.Equal(0, result.GetProperty("dup").GetInt32());
+    }
+
+    [Fact]
+    public async Task Telemetry_AllSamplesOutOfWindow_Returns400WithTinyBody()
+    {
+        var client = await EnrolledClientAsync();
+        var future = DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeSeconds();
+
+        var (status, body) = await PostRawAsync(
+            client, "/d/v1/telemetry", $$"""{"seq":1,"cfgv":0,"samples":[{"ts":{{future}},"tc":1}]}""");
+
+        Assert.Equal(HttpStatusCode.BadRequest, status);
+        Assert.Equal("""{"err":"bad_request"}""", body);
+    }
+
+    [Fact]
+    public async Task Telemetry_FutureSampleInsideGoodBatch_IsDroppedNotRejected()
+    {
+        var client = await EnrolledClientAsync();
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + 1;
+
+        var result = await PostTelemetryAsync(
+            client,
+            $$"""{"seq":1,"cfgv":0,"samples":[{"ts":{{now}},"tc":1},{"ts":{{now + 3600}},"tc":2}]}""");
+
+        Assert.Equal(1, result.GetProperty("accepted").GetInt32());
+    }
+
+    [Fact]
+    public async Task Telemetry_HumidityOutOfRange_StoresNull_InsteadOfFailingTheBatch()
+    {
+        var client = await EnrolledClientAsync();
+        var ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + 1;
+
+        // 101 would trip the CHECK; as a 500 the device would retry the batch for ever (§5.3).
+        var result = await PostTelemetryAsync(
+            client, $$"""{"seq":1,"cfgv":0,"samples":[{"ts":{{ts}},"tc":214,"p":746,"h":101}]}""");
+        Assert.Equal(1, result.GetProperty("accepted").GetInt32());
+
+        await using var conn = new NpgsqlConnection(fixture.IngestConnectionString);
+        await conn.OpenAsync();
+        await using var cmd = new NpgsqlCommand("SELECT humidity_pct FROM telemetry WHERE ts = @ts", conn);
+        cmd.Parameters.AddWithValue("ts", DateTimeOffset.FromUnixTimeSeconds(ts));
+        Assert.True(await cmd.ExecuteScalarAsync() is null or DBNull);
+    }
+
+    [Fact]
+    public async Task Telemetry_MissingSamples_Returns400_Not500()
+    {
+        var client = await EnrolledClientAsync();
+
+        var (status, body) = await PostRawAsync(client, "/d/v1/telemetry", """{"seq":1,"cfgv":0}""");
+
+        Assert.Equal(HttpStatusCode.BadRequest, status);
+        Assert.Equal("""{"err":"bad_request"}""", body);
+    }
+
+    [Fact]
+    public async Task Enroll_EleventhAttemptInAMinute_IsRateLimited()
+    {
+        var client = _factory.CreateClient();
+        const string request = """{"code":"ZZZZ-ZZZZ","hw":"esp8266-1m","mac":"000000000000"}""";
+
+        for (var i = 0; i < 10; i++)
+        {
+            var (status, _) = await PostRawAsync(client, "/d/v1/enroll", request);
+            Assert.Equal(HttpStatusCode.BadRequest, status);
+        }
+
+        var response = await client.PostAsync("/d/v1/enroll", new StringContent(request, Encoding.UTF8, "application/json"));
+        Assert.Equal(HttpStatusCode.TooManyRequests, response.StatusCode);
+        Assert.Equal("""{"err":"slow_down"}""", await response.Content.ReadAsStringAsync());
+        Assert.NotNull(response.Headers.RetryAfter);
+    }
+
+    private async Task<HttpClient> EnrolledClientAsync()
+    {
+        var accountId = await SeedAccountAsync();
+        var (code, mac) = await SeedEnrollmentCodeAsync(accountId);
+        var token = await EnrollAsync(code, mac);
+        var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        return client;
+    }
+
+    private static async Task<(HttpStatusCode Status, string Body)> PostRawAsync(HttpClient client, string path, string json)
+    {
+        var response = await client.PostAsync(path, new StringContent(json, Encoding.UTF8, "application/json"));
+        return (response.StatusCode, await response.Content.ReadAsStringAsync());
     }
 
     [Fact]
@@ -103,7 +226,7 @@ public class DeviceContractTests(PostgresFixture fixture) : IDisposable
         var (code, mac) = await SeedEnrollmentCodeAsync(accountId);
         var token = await EnrollAsync(code, mac, model: "bmp280");
 
-        var ts = DateTimeOffset.UtcNow.AddMinutes(-1).ToUnixTimeSeconds();
+        var ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + 1;
         var requestJson = await LoadFixtureAsync("telemetry_request_bmp280.json", ("__TS0__", ts.ToString()));
 
         var client = _factory.CreateClient();
