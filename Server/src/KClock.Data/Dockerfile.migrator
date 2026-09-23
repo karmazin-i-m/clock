@@ -1,0 +1,20 @@
+# Produces a `dotnet ef migrations bundle` (DESIGN.md §12) — a self-contained executable, not
+# a copy of the SDK, so the runtime stage needs no .NET runtime at all. Build context is
+# Server/ (see compose.yaml).
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+COPY . .
+RUN dotnet tool restore
+RUN dotnet dotnet-ef migrations bundle \
+    --project src/KClock.Data/KClock.Data.csproj \
+    --startup-project src/KClock.Data/KClock.Data.csproj \
+    --context ClockDbContext \
+    --self-contained -r linux-x64 \
+    -o /out/migrate
+
+FROM mcr.microsoft.com/dotnet/runtime-deps:10.0 AS runtime
+WORKDIR /app
+COPY --from=build /out/migrate ./migrate
+# Shell form deliberately, not exec-form JSON: ConnectionStrings__Migrator must go through
+# shell expansion to reach the bundle's --connection argument.
+ENTRYPOINT ./migrate --connection "$ConnectionStrings__Migrator"

@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/KClock.Api/KClock.Api.csproj" />
+    <Project Path="src/KClock.Data/KClock.Data.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/KClock.Tests/KClock.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/KClock.FakeDevice/KClock.FakeDevice.csproj" />
+  </Folder>
+</Solution>

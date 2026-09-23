@@ -1,0 +1,18 @@
+{
+	# ECDSA from Let's Encrypt for a short chain (DESIGN.md §4). Never fingerprint-pin —
+	# Let's Encrypt reissues every 90 days and that would blind the whole device fleet.
+	key_type p256
+}
+
+{$DOMAIN} {
+	# Load-bearing and easy to mistake for dead configuration: a 40 KB heap device must never
+	# receive a Content-Encoding it has to inflate (DESIGN.md §5 rule 3). This must stay
+	# matched to the /d/v1 prefix even if routes are added elsewhere under /d/.
+	encode zstd gzip {
+		match {
+			not path /d/*
+		}
+	}
+
+	reverse_proxy api:8080
+}

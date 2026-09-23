@@ -1,0 +1,71 @@
+services:
+  db:
+    image: timescale/timescaledb-ha:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      CLOCK_MIGRATOR_PASSWORD: ${CLOCK_MIGRATOR_PASSWORD}
+      CLOCK_APP_PASSWORD: ${CLOCK_APP_PASSWORD}
+      CLOCK_INGEST_PASSWORD: ${CLOCK_INGEST_PASSWORD}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: runs the EF migrations bundle as clock_migrator, then exits. `api` waits for it
+  # to succeed rather than racing it — Database.Migrate() on startup is never used, so
+  # replicas can't race each other either (DESIGN.md §12).
+  migrator:
+    build:
+      context: .
+      dockerfile: src/KClock.Data/Dockerfile.migrator
+    restart: "no"
+    environment:
+      ConnectionStrings__Migrator: "Host=db;Database=${POSTGRES_DB};Username=clock_migrator;Password=${CLOCK_MIGRATOR_PASSWORD}"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      dockerfile: src/KClock.Api/Dockerfile
+    restart: unless-stopped
+    environment:
+      ConnectionStrings__App: "Host=db;Database=${POSTGRES_DB};Username=clock_app;Password=${CLOCK_APP_PASSWORD};Maximum Pool Size=20"
+      ConnectionStrings__Ingest: "Host=db;Database=${POSTGRES_DB};Username=clock_ingest;Password=${CLOCK_INGEST_PASSWORD};Maximum Pool Size=20"
+      Authentication__Google__ClientId: "${GOOGLE_CLIENT_ID}"
+      Authentication__Google__ClientSecret: "${GOOGLE_CLIENT_SECRET}"
+      DataProtectionKeysPath: "${DATA_PROTECTION_KEYS_PATH}"
+    volumes:
+      - dp-keys:${DATA_PROTECTION_KEYS_PATH}
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: "${DOMAIN}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - api
+
+volumes:
+  db-data:
+  dp-keys:
+  caddy-data:
+  caddy-config:
