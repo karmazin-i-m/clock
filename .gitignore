@@ -35,6 +35,7 @@ bin/
 obj/
 *.user
 .env
+compose.override.yaml
 **/appsettings.*.local.json
 
 # --- Editors and OS ----------------------------------------------------------
