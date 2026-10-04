@@ -111,6 +111,14 @@ builder.Services.AddRateLimiter(options =>
     };
 });
 
+// Off outside Development unless OpenApi:Enabled says otherwise: the document describes every
+// endpoint, including the device contract, and publishing it is a decision, not a default.
+var openApiEnabled = builder.Configuration.GetValue("OpenApi:Enabled", builder.Environment.IsDevelopment());
+if (openApiEnabled)
+{
+    builder.Services.AddOpenApi();
+}
+
 var app = builder.Build();
 
 app.UseForwardedHeaders();
@@ -129,6 +137,20 @@ app.MapGet("/health/ready", async (IngestDbContext db, CancellationToken ct) =>
     await db.Database.CanConnectAsync(ct)
         ? Results.Ok(new { status = "ok" })
         : Results.StatusCode(StatusCodes.Status503ServiceUnavailable));
+
+if (openApiEnabled)
+{
+    app.MapOpenApi();
+
+    // Same origin, so "Try it out" carries the session cookie; sign in at /auth/google/start
+    // first. The interceptor adds the header RequestedWithCsrfFilter demands, without which
+    // every non-GET call under /api answers 403.
+    app.UseSwaggerUI(options =>
+    {
+        options.SwaggerEndpoint("/openapi/v1.json", "K-Clock API v1");
+        options.UseRequestInterceptor("(req) => { req.headers['X-Requested-With'] = 'swagger'; return req; }");
+    });
+}
 
 app.UseHttpMetrics();
 app.MapMetrics();

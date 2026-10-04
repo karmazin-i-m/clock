@@ -43,6 +43,7 @@ services:
       Authentication__Google__ClientId: "${GOOGLE_CLIENT_ID}"
       Authentication__Google__ClientSecret: "${GOOGLE_CLIENT_SECRET}"
       DataProtectionKeysPath: "${DATA_PROTECTION_KEYS_PATH}"
+      OpenApi__Enabled: "${OPENAPI_ENABLED:-false}"
     volumes:
       - dp-keys:${DATA_PROTECTION_KEYS_PATH}
     depends_on:
