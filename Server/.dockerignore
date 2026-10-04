@@ -1,0 +1,6 @@
+# Host build output must never reach the image: obj/project.assets.json names the host's NuGet
+# cache (~/.nuget/packages), and `dotnet ef migrations bundle` reads it without restoring.
+**/bin/
+**/obj/
+.idea/
+.env
