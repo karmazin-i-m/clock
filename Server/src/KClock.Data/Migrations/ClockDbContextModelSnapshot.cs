@@ -243,9 +243,9 @@ namespace KClock.Data.Migrations
                         .HasColumnType("bigint")
                         .HasColumnName("device_id");
 
-                    b.Property<string>("EspVersion")
+                    b.Property<string>("FwVersion")
                         .HasColumnType("text")
-                        .HasColumnName("esp_version");
+                        .HasColumnName("fw_version");
 
                     b.Property<DateTimeOffset?>("LastIngestAt")
                         .HasColumnType("timestamp with time zone")
@@ -254,10 +254,6 @@ namespace KClock.Data.Migrations
                     b.Property<long?>("LastSeq")
                         .HasColumnType("bigint")
                         .HasColumnName("last_seq");
-
-                    b.Property<string>("NanoVersion")
-                        .HasColumnType("text")
-                        .HasColumnName("nano_version");
 
                     b.HasKey("DeviceId")
                         .HasName("pk_device_state");

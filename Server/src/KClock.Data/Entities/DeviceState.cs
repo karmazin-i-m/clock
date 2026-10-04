@@ -10,6 +10,5 @@ public class DeviceState
     public long DeviceId { get; set; }
     public DateTimeOffset? LastIngestAt { get; set; }
     public long? LastSeq { get; set; }
-    public string? EspVersion { get; set; }
-    public string? NanoVersion { get; set; }
+    public string? FwVersion { get; set; }
 }

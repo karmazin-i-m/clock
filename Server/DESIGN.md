@@ -453,11 +453,14 @@ The firmware's sentinels (`-999` temperature, `-1` pressure, `-1` humidity) beco
 `-99.9 °C`, and any future `avg()` would be quietly wrong. The `CHECK` on humidity means
 the sentinel cannot get in even by accident.
 
-Firmware versions do **not** sit in every row — they change rarely. They live in
-`device_state(device_id PK, last_ingest_at, last_seq, esp_version, nano_version, …)`,
-which is deliberately a **separate table from `device`**: `device` is cold and read by
-every browser request, `device_state` is written on every batch. Keeping them apart keeps
-the hot write off the row the UI reads.
+The firmware version does **not** sit in every row — it changes rarely. It lives in
+`device_state(device_id PK, last_ingest_at, last_seq, fw_version)`, one column rather than
+one per chip: the server talks only to the network module, `fw` is that module's version, and
+what kind of hardware it runs on is already `device.profile`. A second component worth
+tracking would get its own `device_firmware(device_id, component, version)` table, not a
+third column. `device_state` is deliberately a **separate table from `device`**: `device`
+is cold and read by every browser request, `device_state` is written on every batch.
+Keeping them apart keeps the hot write off the row the UI reads.
 
 ### Compression and aggregates
 

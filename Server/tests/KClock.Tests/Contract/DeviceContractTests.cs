@@ -45,6 +45,13 @@ public class DeviceContractTests(PostgresFixture fixture) : IDisposable
         Assert.Equal(10, policy.GetProperty("sample_s").GetInt32());
         Assert.Equal(60, policy.GetProperty("flush_s").GetInt32());
         Assert.Equal(12, policy.GetProperty("max_batch").GetInt32());
+
+        await using var conn = new NpgsqlConnection(fixture.MigratorConnectionString);
+        await conn.OpenAsync();
+        await using var cmd = new NpgsqlCommand(
+            "SELECT s.fw_version FROM device_state s JOIN device d ON d.id = s.device_id WHERE d.hardware_id = @mac", conn);
+        cmd.Parameters.AddWithValue("mac", mac);
+        Assert.Equal("2026.09.23", await cmd.ExecuteScalarAsync());
     }
 
     [Fact]

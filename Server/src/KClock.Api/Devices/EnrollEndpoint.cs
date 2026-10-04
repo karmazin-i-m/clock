@@ -112,6 +112,19 @@ public static class EnrollEndpoint
             IssuedAt = now,
         });
 
+        // The telemetry request carries no fw, so enrollment is the only moment the server
+        // learns the firmware version; a re-enrollment overwrites it.
+        var fw = string.IsNullOrWhiteSpace(request.Fw) ? null : request.Fw.Trim();
+        var state = await db.DeviceStates.SingleOrDefaultAsync(s => s.DeviceId == device.Id, ct);
+        if (state is null)
+        {
+            db.DeviceStates.Add(new DeviceState { DeviceId = device.Id, FwVersion = fw });
+        }
+        else
+        {
+            state.FwVersion = fw;
+        }
+
         // Step 7: mark the code consumed.
         code.ConsumedAt = now;
         code.ConsumedDeviceId = device.Id;

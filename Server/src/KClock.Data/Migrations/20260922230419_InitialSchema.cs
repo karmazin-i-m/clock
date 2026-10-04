@@ -153,8 +153,7 @@ namespace KClock.Data.Migrations
                     device_id = table.Column<long>(type: "bigint", nullable: false),
                     last_ingest_at = table.Column<DateTimeOffset>(type: "timestamp with time zone", nullable: true),
                     last_seq = table.Column<long>(type: "bigint", nullable: true),
-                    esp_version = table.Column<string>(type: "text", nullable: true),
-                    nano_version = table.Column<string>(type: "text", nullable: true)
+                    fw_version = table.Column<string>(type: "text", nullable: true)
                 },
                 constraints: table =>
                 {
