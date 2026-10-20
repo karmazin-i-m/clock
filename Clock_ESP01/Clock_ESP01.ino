@@ -58,11 +58,23 @@ static const unsigned long LinkBaud = 9600;
 
 static const uint8_t StatusLedPin = LED_BUILTIN;
 
-// Fast even blinking while the portal waits for somebody, a short flash every
-// couple of seconds once the module is on a network.
+// Fast even blinking while the portal waits for somebody, and dark once the
+// module is on a network. It used to flash every couple of seconds online too,
+// and on a desk at night the blue LED is far brighter than the clock's own
+// dimmed panel; the status page already says whether the module is online.
 static const unsigned long PortalBlinkMs = 150;
-static const unsigned long OnlinePeriodMs = 2000;
-static const unsigned long OnlineFlashMs = 60;
+
+// After a power cut the module is up long before the router is, finds nothing
+// to join, and raises the portal - and WiFiManager switches the station side
+// off while the portal runs, so it would never look for the network again.
+// With a network saved, the portal therefore gives up after this long, unless
+// a phone is connected to it, and loop() tries the saved network again.
+static const unsigned long PortalRetrySeconds = 180;
+
+// Bounds one attempt at the saved network. It blocks loop() for that long, the
+// link to the Nano included, so it is kept short; a router that is up answers
+// within a few seconds.
+static const unsigned long ConnectTimeoutSeconds = 20;
 
 static const unsigned long StatusPollMs = 3000;
 static const unsigned long ConfigPollMs = 30000;
@@ -1104,10 +1116,14 @@ void setup() {
   wm.setTitle(ApName);
   wm.setAPCallback(portalRaised);
 
-  // Zero means the portal stays up until somebody configures it, which is also
-  // how the module recovers from a router that was replaced: it fails to join,
-  // raises K-Clock, and waits.
-  wm.setConfigPortalTimeout(0);
+  // With nothing saved there is nothing to retry, so the portal stays up until
+  // somebody configures it. With a network saved it times out and loop() tries
+  // that network again - see PortalRetrySeconds. A replaced router is still
+  // recovered the same way: the portal keeps coming back between attempts, and
+  // a phone that joins it holds it open.
+  wm.setConfigPortalTimeout(wm.getWiFiIsSaved() ? PortalRetrySeconds : 0);
+  wm.setAPClientCheck(true);
+  wm.setConnectTimeout(ConnectTimeoutSeconds);
 
   // Blocking autoConnect() never returns while the portal is open, which would
   // freeze both the status LED and the link to the Nano.
@@ -1130,8 +1146,17 @@ void loop() {
   unsigned long now = millis();
   bool online = WiFi.status() == WL_CONNECTED;
 
+  // Only until the first connection. After that the SDK's own auto-reconnect
+  // carries the module through a router restart, as it always has, and going
+  // through autoConnect would put the portal up for every brief drop.
+  if (!serverStarted && !online && !wm.getConfigPortalActive()) {
+    wm.autoConnect(ApName);
+    online = WiFi.status() == WL_CONNECTED;
+    now = millis();
+  }
+
   if (online) {
-    setStatusLed(now % OnlinePeriodMs < OnlineFlashMs);
+    setStatusLed(false);
   } else if (now - blinkTime >= PortalBlinkMs) {
     blinkTime = now;
     setStatusLed(!ledLit);
