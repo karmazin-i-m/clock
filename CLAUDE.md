@@ -372,8 +372,8 @@ the incoming one are both in flash during an update, and the `Updater` wants
 size get 125 each. Past that, OTA fails on the module with nothing to explain it. Linking
 BearSSL (Server/DESIGN.md §4) took the image from 409 KB to 528 KB, +118 KB rather than the
 50-80 KB the design estimated, which would flash once over the plain firmware and never again
-over itself. `build.sh` gets it back under the ceiling with three options - ~494 KB with the
-binding client, leaving ~18 KB for telemetry - measured on
+over itself. `build.sh` gets it back under the ceiling with three options - ~497 KB with the
+binding and telemetry client, leaving ~15 KB - measured on
 core 3.1.2: `build.float=` drops the `-u _printf_float -u _scanf_float` the core forces (-17 KB;
 nothing here formats a float through `printf`, and `String(float)` goes through `dtostrf`, which
 does not need it), `-DWM_NODEBUG` drops WiFiManager's log strings (-11 KB, its output was already
@@ -410,6 +410,29 @@ which only appended it, so a `KCL2` module keeps its other settings and starts u
 replaced only by a successful enrollment and never cleared because the server refused it —
 the 401 rule in §5.3 — and it never appears on a page; the status page says only whether one is
 held. `FwVersion` is what the server records, and only at enrollment, so bump it with a release.
+
+**Telemetry samples into RAM and sends in batches** (Server/DESIGN.md §5.2), because a ~4 s
+handshake per sample would keep the module on the network a tenth of its life. Every
+`sample_s` the last `<S` reading goes into a 180-slot ring, stamped with NTP time — the DS3231
+keeps zoneless local time and cannot give an epoch — and every `flush_s` up to `max_batch` of
+the oldest go out in one `POST /d/v1/telemetry`. All three come from the server's `policy`,
+on enroll and on every batch, and start at its `esp8266-1m` defaults; `max_batch` is capped
+at 16, which is what the request buffer holds. Sampling runs on a fixed grid, so a sample that
+a handshake delays does not push every later one back. After a successful batch with a
+backlog left, the next one follows in 5 s, so a full ring drains in under a minute. The
+status codes follow §5.3: 400 drops the batch, 401/403/404 hold off for an hour **and keep
+the token**, 413 retries once at half size, 429 honours `Retry-After`, anything else keeps the
+samples and backs off 1, 2, 5, 10, 15 minutes. A full ring overwrites its oldest sample and
+counts it, and the status page shows that count with the queue and the last send.
+`seq` restarts at 1 on boot, on purpose, so the server can see the restart.
+
+**The request and reply share one static 1 KB buffer**, `cloudBuffer`, which `cloudPost()` can
+do because it has written the whole request before it reads a byte. Both used to be locals,
+and with a batch and its reply on loop()'s 4 KB stack a flush left under 500 bytes of it; the
+status page's memory row carries the stack low-water mark (`ESP.getFreeContStack()`) so that
+stays visible. Verified on the module: 200, a 502 outage with the backoff and a clean drain
+afterwards, and a revoked credential showing 401 with the token kept. 400, 413 and 429 were
+not reproduced against the real server.
 
 **Going quiet means leaving the wire, not just stopping the data.** This is the whole point and
 it was got wrong once: a UART transmit pin is a push-pull output idling high, so an ESP that

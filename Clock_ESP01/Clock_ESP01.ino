@@ -562,9 +562,12 @@ bool enrollPending;
 const __FlashStringHelper *enrollResult;
 int enrollHttpStatus;
 
+// The stack figure is the low-water mark since boot. It is worth watching:
+// a connect() runs on loop()'s 4 KB stack, and once had under 500 bytes left.
 static String heapSummary() {
   return String(ESP.getFreeHeap()) + F(" / ") + ESP.getMaxFreeBlockSize() +
-         F(" Б, фрагм. ") + ESP.getHeapFragmentation() + F(" %");
+         F(" Б, фрагм. ") + ESP.getHeapFragmentation() + F(" %, стек ") +
+         ESP.getFreeContStack() + F(" Б");
 }
 
 // Server/DESIGN.md §5 rule 5: every key is unique as a substring of the whole
@@ -588,10 +591,17 @@ static bool jsonString(const char *json, const char *key, char *out, size_t size
   return true;
 }
 
+// Requests are built here and replies read back into it. One buffer serves
+// both because cloudPost() has written the whole request before it reads a
+// byte, and it lives in BSS rather than on loop()'s 4 KB stack: with a batch
+// and its reply both there, a flush left under 500 bytes of stack.
+char cloudBuffer[1024];
+
 // One POST on one connection, closed afterwards: Caddy resumes sessions only
 // from tickets and BearSSL only from session IDs, so a kept socket would buy
 // nothing by the next request. Blocks loop() for the handshake, ~4 s at
-// 160 MHz. Returns the HTTP status, or 0 when nothing usable came back.
+// 160 MHz. Returns the HTTP status, or 0 when nothing usable came back. json
+// and reply may be the same buffer.
 static int cloudPost(const char *path, const char *json, const char *token,
                      char *reply, size_t replySize, char **body) {
   BearSSL::X509List anchors(CloudAnchors);
@@ -663,6 +673,91 @@ static const __FlashStringHelper *describeEnrollError(int status, const char *er
   return F("сервер відмовив");
 }
 
+// Telemetry is Server/DESIGN.md §5.2: sample into RAM every sample_s, send a
+// batch over one connection every flush_s. A handshake costs ~4 s, so sending
+// every sample would keep the module on the network a tenth of its life.
+//
+// Thirty minutes of ring at the default cadence - an outage longer than that
+// loses the oldest readings, which is counted rather than hidden - and well
+// inside the two hours the server still accepts a late sample for.
+static const uint16_t RingCapacity = 180;
+
+// max_batch is the server's to set, but never past what the request buffer in
+// cloudFlush() is sized for. The esp32 profile's 60 is not for this chip.
+static const uint8_t MaxBatchCap = 16;
+
+// The gap between batches while a backlog drains after an outage, so a full
+// ring is gone in a couple of minutes instead of half an hour.
+static const unsigned long BacklogFlushMs = 5000;
+static const unsigned long CloudHoldMs = 3600000UL;
+static const uint8_t BackoffMinutes[] = {1, 2, 5, 10, 15};
+
+struct Sample {
+  uint32_t ts;
+  int16_t tc;
+  int16_t p;
+  int8_t h;  // negative on a BMP280 board, and then left out of the batch
+};
+
+Sample ring[RingCapacity];
+uint16_t ringHead;  // the oldest sample
+uint16_t ringCount;
+unsigned long ringLost;
+
+// The policy as the server last handed it down, starting from its own
+// esp8266-1m defaults so the first batch needs nothing from it.
+unsigned long sampleMs = 10000;
+unsigned long flushMs = 60000;
+uint8_t maxBatch = 12;
+
+unsigned long sampleTime;
+unsigned long flushStart;
+unsigned long flushWaitMs = 60000;
+
+// Counts batches since boot, so a drop back to 1 tells the server the module
+// restarted. A batch that is retried keeps its number.
+uint32_t batchSeq = 1;
+uint8_t backoffStep;
+
+// A 413 earns one retry at half the size; this is that retry's limit.
+uint8_t halvedLimit;
+
+// The last flush's HTTP status, 0 for no usable answer, -1 before the first.
+int flushHttpStatus = -1;
+unsigned long flushOkAt;
+
+// Rule 5 again: "key": is the key. Numbers are plain integers on this wire.
+static bool jsonInt(const char *json, const char *key, long *out) {
+  char pattern[24];
+  snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+  const char *at = strstr(json, pattern);
+  if (at == NULL) {
+    return false;
+  }
+  at += strlen(pattern);
+  if (*at != '-' && !isDigit(*at)) {
+    return false;
+  }
+  *out = atol(at);
+  return true;
+}
+
+// Both enroll and telemetry answer with one. A value outside these bounds is
+// ignored rather than clamped: it means the server is wrong, and the last good
+// cadence is a better guess than the nearest legal one.
+static void applyPolicy(const char *json) {
+  long value;
+  if (jsonInt(json, "sample_s", &value) && value >= 5 && value <= 3600) {
+    sampleMs = value * 1000UL;
+  }
+  if (jsonInt(json, "flush_s", &value) && value >= 15 && value <= 3600) {
+    flushMs = value * 1000UL;
+  }
+  if (jsonInt(json, "max_batch", &value) && value >= 1) {
+    maxBatch = value > MaxBatchCap ? MaxBatchCap : value;
+  }
+}
+
 // No retry on failure: the code is single use and lives fifteen minutes, so a
 // refused one is spent and a fresh one has to come from the account anyway.
 void cloudEnroll() {
@@ -675,17 +770,16 @@ void cloudEnroll() {
            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
 
   // The Nano reports -1 for humidity on a BMP280 board.
-  char json[160];
-  snprintf(json, sizeof(json),
+  snprintf(cloudBuffer, sizeof(cloudBuffer),
            "{\"code\":\"%s\",\"hw\":\"%s\",\"fw\":\"%s\",\"mac\":\"%s\","
            "\"model\":\"%s\",\"chip\":\"%08x\"}",
            enrollCode, DeviceProfile, FwVersion, mac,
            clockStatus.humidityPercent >= 0 ? "bme280" : "bmp280", ESP.getChipId());
   memset(enrollCode, 0, sizeof(enrollCode));
 
-  char reply[1024];
   char *body = NULL;
-  enrollHttpStatus = cloudPost("/d/v1/enroll", json, NULL, reply, sizeof(reply), &body);
+  enrollHttpStatus = cloudPost("/d/v1/enroll", cloudBuffer, NULL,
+                               cloudBuffer, sizeof(cloudBuffer), &body);
 
   char token[sizeof(settings.token)];
   if (enrollHttpStatus == 200 && jsonString(body, "token", token, sizeof(token)) &&
@@ -693,6 +787,16 @@ void cloudEnroll() {
     strcpy(settings.token, token);
     saveSettings();
     enrollResult = F("прив'язано");
+
+    // A new token undoes whatever the old one had earned: a 401 hold, a
+    // backoff. The ring stays - the server files each sample under the binding
+    // its timestamp falls in, so the previous owner's readings still reach them.
+    applyPolicy(body);
+    flushHttpStatus = -1;
+    backoffStep = 0;
+    halvedLimit = 0;
+    flushStart = millis();
+    flushWaitMs = flushMs;
     return;
   }
 
@@ -709,6 +813,134 @@ static const __FlashStringHelper *enrollWaitingFor() {
   if (!haveRealTime())                return F("чекає на час з NTP");
   if (!linkAlive())                   return F("чекає на годинник");
   return F("виконується");
+}
+
+// The reading the Nano last reported, stamped with our own NTP time - the
+// DS3231 keeps local time with no zone attached, so it cannot give an epoch.
+void cloudSample() {
+  uint16_t index = (ringHead + ringCount) % RingCapacity;
+  if (ringCount == RingCapacity) {
+    ringHead = (ringHead + 1) % RingCapacity;
+    ringLost++;
+  } else {
+    ringCount++;
+  }
+
+  int humidity = clockStatus.humidityPercent;
+  ring[index].ts = time(nullptr);
+  ring[index].tc = clockStatus.temperatureTenths;
+  ring[index].p = clockStatus.pressureMmHg;
+  ring[index].h = humidity < 0 ? -1 : (humidity > 127 ? 127 : humidity);
+}
+
+static void dropOldest(uint8_t count) {
+  ringHead = (ringHead + count) % RingCapacity;
+  ringCount -= count;
+}
+
+// What each answer means is Server/DESIGN.md §5.3, and the one to get right is
+// 401: the token stays. A bad deploy answering 401 for everyone would
+// otherwise unbind the whole fleet for good; a 401 is a state, not an event.
+void cloudFlush() {
+  uint8_t limit = halvedLimit ? halvedLimit : maxBatch;
+  uint8_t count = ringCount < limit ? ringCount : limit;
+
+  // The widest sample is 49 characters and a comma.
+  static_assert(40 + MaxBatchCap * 50 <= sizeof(cloudBuffer), "a full batch must fit");
+  char *json = cloudBuffer;
+  int length = snprintf(json, sizeof(cloudBuffer), "{\"seq\":%lu,\"cfgv\":0,\"samples\":[",
+                        (unsigned long)batchSeq);
+  for (uint8_t i = 0; i < count; i++) {
+    const Sample &s = ring[(ringHead + i) % RingCapacity];
+    length += snprintf(json + length, sizeof(cloudBuffer) - length,
+                       s.h >= 0 ? "%s{\"ts\":%lu,\"tc\":%d,\"p\":%d,\"h\":%d}"
+                                : "%s{\"ts\":%lu,\"tc\":%d,\"p\":%d}",
+                       i ? "," : "", (unsigned long)s.ts, s.tc, s.p, s.h);
+  }
+  snprintf(json + length, sizeof(cloudBuffer) - length, "]}");
+
+  char *body = NULL;
+  flushHttpStatus = cloudPost("/d/v1/telemetry", json, settings.token,
+                              cloudBuffer, sizeof(cloudBuffer), &body);
+  flushStart = millis();
+
+  bool done = false;  // the batch is finished with, accepted or not
+  switch (flushHttpStatus) {
+    case 200:
+      done = true;
+      backoffStep = 0;
+      flushOkAt = flushStart;
+      applyPolicy(body);
+      flushWaitMs = ringCount - count >= maxBatch ? BacklogFlushMs : flushMs;
+      break;
+
+    case 400:
+      // Never retried: a batch the server cannot take would wedge the ring.
+      done = true;
+      flushWaitMs = flushMs;
+      break;
+
+    case 401:
+    case 403:
+    case 404:
+      flushWaitMs = CloudHoldMs;
+      break;
+
+    case 413:
+      if (!halvedLimit && count > 1) {
+        halvedLimit = count / 2;
+        flushWaitMs = BacklogFlushMs;
+        return;
+      }
+      done = true;
+      flushWaitMs = flushMs;
+      break;
+
+    case 429: {
+      const char *after = strcasestr(cloudBuffer, "\r\nretry-after:");
+      long seconds = after != NULL && after < body ? atol(after + 14) : 0;
+      if (seconds > 0) {
+        flushWaitMs = (unsigned long)seconds * 1000UL;
+        break;
+      }
+      // A 429 without a usable Retry-After is backed off like a 5xx.
+      [[fallthrough]];
+    }
+    default:
+      flushWaitMs = BackoffMinutes[backoffStep] * 60000UL;
+      if (backoffStep < sizeof(BackoffMinutes) - 1) {
+        backoffStep++;
+      }
+      break;
+  }
+
+  if (done) {
+    dropOldest(count);
+    batchSeq++;
+    halvedLimit = 0;
+  }
+}
+
+static String cloudSendState() {
+  String state;
+  switch (flushHttpStatus) {
+    case -1:  return F("ще не було");
+    case 200: state = F("працює"); break;
+    case 401: return F("сервер не приймає токен — прив'яжіть заново; повтор щогодини");
+    case 403:
+    case 404: return String(F("сервер відмовив (HTTP ")) + flushHttpStatus + F("); повтор щогодини");
+    case 0:   state = F("немає з'єднання"); break;
+    default:  state = String(F("помилка сервера (HTTP ")) + flushHttpStatus + F(")"); break;
+  }
+
+  if (flushOkAt != 0) {
+    state += String(F(", вдало ")) + (millis() - flushOkAt) / 1000 + F(" с тому");
+  }
+  unsigned long elapsed = millis() - flushStart;
+  if (flushHttpStatus != 200 && elapsed < flushWaitMs) {
+    state += String(F("; повтор через ")) + (flushWaitMs - elapsed) / 1000 + F(" с");
+  }
+  return state;
 }
 
 // -------------------------------------------------------------------- pages --
@@ -812,6 +1044,12 @@ void handleRoot() {
       result += String(F(" (HTTP ")) + enrollHttpStatus + F(")");
     }
     appendRow(page, F("Остання спроба"), result);
+  }
+
+  if (settings.token[0]) {
+    appendRow(page, F("Відправка"), cloudSendState());
+    appendRow(page, F("У черзі / втрачено"),
+              String(ringCount) + F(" / ") + ringLost + F(" вимірів"));
   }
 
   appendRow(page, F("Пам'ять (вільно / блок)"), heapSummary());
@@ -1272,6 +1510,23 @@ void loop() {
   // redirect; the page it lands on waits out the handshake and shows the result.
   if (enrollPending && online && haveRealTime() && linkAlive()) {
     cloudEnroll();
+  }
+
+  // Sampling needs a fresh reading and a real time; sending needs only the
+  // network, so a backlog still drains while the clock is unplugged.
+  if (settings.token[0] && online && haveRealTime()) {
+    // On a grid rather than from the last sample, or every 4 s handshake would
+    // push the rest back and a minute would end up holding five samples, not
+    // six. A module more than a period behind - after boot, or a long outage
+    // of the link - starts a fresh grid instead of catching up in a burst.
+    if (linkAlive() && now - sampleTime >= sampleMs) {
+      sampleTime = now - sampleTime >= 2 * sampleMs ? now : sampleTime + sampleMs;
+      cloudSample();
+    }
+
+    if (ringCount > 0 && millis() - flushStart >= flushWaitMs) {
+      cloudFlush();
+    }
   }
 
   // The first push happens as soon as there is a real time to push; after that
