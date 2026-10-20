@@ -348,9 +348,13 @@ and restarts without dropping registered services.
 filesystem this firmware never mounts — credentials live in the SDK's own area and the settings
 in emulated EEPROM — and that reservation comes straight out of the space an update needs. The
 two layouts put `_EEPROM_start` at the same address, so the stored settings survive the switch.
-An OTA upload takes two commands, because `-F/--upload-field` belongs to `upload` and
-`compile --upload` refuses it with `unknown flag` - compile into the default cache, then upload
-straight after.
+**Build and flash it with `Clock_ESP01/build.sh`, not a bare `arduino-cli compile`.** The script
+carries the options the image cannot do without and fails the build past the OTA ceiling below;
+`build.sh upload [host]` then flashes it, taking the password from `$OTA_PASSWORD` or asking.
+It is two commands inside, because `-F/--upload-field` belongs to `upload` and
+`compile --upload` refuses it with `unknown flag`. It also retries the upload: straight after a
+restart the module answers HTTP before its `_arduino._tcp` advertisement has reached
+arduino-cli, which then reports `port not found` without trying.
 
 OTA starts with the compiled-in `DefaultOtaPassword`, `k-clock`, which `loadSettings()` writes
 into a fresh EEPROM and also fills in for a module whose stored password is empty — that is a
@@ -362,10 +366,33 @@ password rather than as a refusal. Changing the password restarts the module, be
 `begin()` has run and `begin()` itself returns early when already initialised — so calling
 `startOta()` a second time would appear to work while the old password stayed in force.
 
-The ceiling is half the chip, since the running image and the incoming one are both in flash
-during an update: ~502 KB against the current 400 KB. Past that, OTA fails with nothing to
-explain it. Recovery from a bad image is the portal — `autoConnect` raises `K-Clock` when it
-cannot join — and only an image that crashes earlier than that needs the cable.
+**The ceiling is 512000 bytes, and TLS put the image right under it.** The running image and
+the incoming one are both in flash during an update, and the `Updater` wants
+`roundup4K(running) + roundup4K(incoming) <= 0xFB000` — 251 sectors, so two images of the same
+size get 125 each. Past that, OTA fails on the module with nothing to explain it. Linking
+BearSSL for the `/probe` page (Server/DESIGN.md §4) took the image from 409 KB to 528 KB, +118 KB
+rather than the 50-80 KB the design estimated, which would flash once over the plain firmware
+and never again over itself. `build.sh` gets it back to ~499 KB with three options, measured on
+core 3.1.2: `build.float=` drops the `-u _printf_float -u _scanf_float` the core forces (-17 KB;
+nothing here formats a float through `printf`, and `String(float)` goes through `dtostrf`, which
+does not need it), `-DWM_NODEBUG` drops WiFiManager's log strings (-11 KB, its output was already
+off), and `xtal=160` costs nothing in flash and halves the handshake. Two levers are left in
+reserve: `ip=lm2n` for another 10 KB at the cost of two of the three NTP servers and the hostname
+in DHCP DISCOVER, and a BearSSL client of our own carrying only ECDHE-ECDSA with one cipher,
+roughly 35 KB, since `WiFiClientSecure` links every suite and RSA whatever `setCiphers` says.
+`ssl=basic` is not one of them: it keeps RSA key exchange only and drops EC altogether.
+
+Recovery from a bad image is the portal — `autoConnect` raises `K-Clock` when it cannot join —
+and only an image that crashes earlier than that needs the cable.
+
+**What the probe measured** on the real module, with everything above resident: ~43 KB free and
+a 30-43 KB largest block at idle, ~12 KB free and a 6-12 KB block while a connection holds its
+buffers. The handshake is a full one every time, 8.0 s at 80 MHz and 4.0 s at 160 MHz - pure
+ECDSA arithmetic over a P-384 chain, which is why the clock speed halves it exactly. There is
+no session resumption to be had: Caddy's Go TLS stack resumes TLS 1.2 only from session
+tickets, and BearSSL only from session IDs. MFLN is refused too, so the buffers stay at 16 KB.
+The anchors are ISRG Root YE and ISRG Root X2, so the chain validates whichever of the two
+Caddy ends it on.
 
 **Going quiet means leaving the wire, not just stopping the data.** This is the whole point and
 it was got wrong once: a UART transmit pin is a push-pull output idling high, so an ESP that

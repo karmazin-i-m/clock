@@ -16,6 +16,7 @@
 // with DEBUG_ON_SERIAL1 as an escape hatch - see below.
 
 #include <ESP8266WiFi.h>
+#include <WiFiClientSecure.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 #include <ESP8266LLMNR.h>
@@ -803,7 +804,193 @@ void handleQuiet() {
   server.send(303);
 }
 
-// --------------------------------------------------------------- discovery --// --------------------------------------------------------------- discovery --
+// ------------------------------------------------------------------- probe --
+
+// Temporary: step one of Server/DESIGN.md §14, which gates the whole cloud
+// client. A BearSSL handshake wants a 16-22 KB contiguous block, and nobody has
+// yet looked at how much is left with the portal, the web server, OTA and three
+// name responders all resident - so this runs inside the real firmware rather
+// than a bare sketch, which would have shown a heap this module never has.
+//
+// It blocks loop() for the seconds a handshake takes. That costs a status poll
+// or two, well inside LinkStaleMs, and it is only ever run by hand.
+static const char ProbeHost[] = "clock.karmazin.com.ua";
+static const uint16_t ProbePort = 443;
+static const unsigned long ProbeReadMs = 5000;
+
+// Two anchors, so the result does not depend on which chain Caddy happens to
+// send: it currently serves leaf, YE1, Root YE cross-signed by X2, and X2
+// cross-signed by X1. BearSSL stops at the first certificate whose issuer is an
+// anchor, so either one carries the chain. Roots rather than the leaf or YE1,
+// because Let's Encrypt reissues those and a fingerprint pin would blind the
+// clock within ninety days.
+static const char ProbeAnchors[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIB2TCCAWCgAwIBAgIRAKQCa6LvbHwg1AR+XmWmk4AwCgYIKoZIzj0EAwMwLjEL
+MAkGA1UEBhMCVVMxDTALBgNVBAoTBElTUkcxEDAOBgNVBAMTB1Jvb3QgWUUwHhcN
+MjUwOTAzMDAwMDAwWhcNNDUwOTAyMjM1OTU5WjAuMQswCQYDVQQGEwJVUzENMAsG
+A1UEChMESVNSRzEQMA4GA1UEAxMHUm9vdCBZRTB2MBAGByqGSM49AgEGBSuBBAAi
+A2IABDwS/6vhrcVqcbBo+wgdI3fwn9x7DNJJOY/lTOti0vkwuRN87RhEhTH17E7X
+yFjWsPYhIPt/wzOqxTd2b+4ZJNy9ID04YywF9U5zasDVyGSNErVNtz8uSGh5izW8
+7j77GaNCMEAwDgYDVR0PAQH/BAQDAgEGMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0O
+BBYEFKPIJlqOoUzQNWP8myPIOq5W809WMAoGCCqGSM49BAMDA2cAMGQCMHhMr8N9
+LdL1VQKs9BdV81r76eXRB6mtjuNjzk6/lBsPNToWLTDzGYgtQKO1jl63uAIwGV7m
+onyF377c+MM1oqVNs17sgu7F9YKZwgLmVbeOMDbKAXHtKMDLbiGllCcs8f47
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIICGzCCAaGgAwIBAgIQQdKd0XLq7qeAwSxs6S+HUjAKBggqhkjOPQQDAzBPMQsw
+CQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2gg
+R3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMjAeFw0yMDA5MDQwMDAwMDBaFw00
+MDA5MTcxNjAwMDBaME8xCzAJBgNVBAYTAlVTMSkwJwYDVQQKEyBJbnRlcm5ldCBT
+ZWN1cml0eSBSZXNlYXJjaCBHcm91cDEVMBMGA1UEAxMMSVNSRyBSb290IFgyMHYw
+EAYHKoZIzj0CAQYFK4EEACIDYgAEzZvVn4CDCuwJSvMWSj5cz3es3mcFDR0HttwW
++1qLFNvicWDEukWVEYmO6gbf9yoWHKS5xcUy4APgHoIYOIvXRdgKam7mAHf7AlF9
+ItgKbppbd9/w+kHsOdx1ymgHDB/qo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T
+AQH/BAUwAwEB/zAdBgNVHQ4EFgQUfEKWrt5LSDv6kviejM9ti6lyN5UwCgYIKoZI
+zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW
+tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1
+/q4AaOeMSQ+2b1tbFfLn
+-----END CERTIFICATE-----
+)EOF";
+
+static String heapSummary() {
+  return String(ESP.getFreeHeap()) + F(" / ") + ESP.getMaxFreeBlockSize() +
+         F(" Б, фрагм. ") + ESP.getHeapFragmentation() + F(" %");
+}
+
+// One handshake, timed, with the heap read while the connection still holds
+// its buffers - that is the figure the real client will live with.
+//
+// There is no MFLN probe: Caddy's Go TLS stack does not implement it, so the
+// buffers stay at the default 16 KB, and the probe cost 1.3 KB of the flash
+// budget to confirm that on every run.
+static bool probeConnect(String &page, const __FlashStringHelper *label,
+                         BearSSL::WiFiClientSecure &client,
+                         BearSSL::X509List &anchors, BearSSL::Session &session) {
+  client.setTrustAnchors(&anchors);
+  client.setX509Time(time(nullptr));
+  client.setSession(&session);
+
+  unsigned long start = millis();
+  bool ok = client.connect(ProbeHost, ProbePort);
+  unsigned long elapsed = millis() - start;
+
+  if (ok) {
+    appendRow(page, label, String(elapsed) + F(" мс"));
+    appendRow(page, F("Пам'ять під час з'єднання"), heapSummary());
+  } else {
+    char reason[64];
+    int code = client.getLastSSLError(reason, sizeof(reason));
+    appendRow(page, label,
+              String(F("помилка ")) + code + F(": ") + escapeAttribute(reason) +
+              F(" (") + elapsed + F(" мс)"));
+  }
+
+  return ok;
+}
+
+// An empty enroll is the device path end to end with no side effect: the
+// server answers 400 bad_request before touching the database. What matters is
+// that a reply arrives at all, how large it is, and that it is not encoded.
+static void probeRequest(String &page, BearSSL::WiFiClientSecure &client) {
+  client.print(F("POST /d/v1/enroll HTTP/1.1\r\nHost: "));
+  client.print(ProbeHost);
+  client.print(F("\r\nContent-Type: application/json\r\nContent-Length: 2\r\n"
+                 "Connection: close\r\n\r\n{}"));
+
+  char reply[768];
+  size_t length = 0;
+  unsigned long start = millis();
+
+  while (length < sizeof(reply) - 1 && millis() - start < ProbeReadMs &&
+         (client.connected() || client.available())) {
+    int got = client.read((uint8_t *)reply + length, sizeof(reply) - 1 - length);
+    if (got > 0) {
+      length += got;
+    } else {
+      delay(10);
+    }
+  }
+  reply[length] = '\0';
+
+  char *lineEnd = strstr(reply, "\r\n");
+  char *body = strstr(reply, "\r\n\r\n");
+  if (lineEnd == NULL || body == NULL) {
+    appendRow(page, F("Відповідь"), String(F("неповна, ")) + length + F(" Б"));
+    return;
+  }
+
+  *lineEnd = '\0';
+  body += 4;
+
+  appendRow(page, F("Статус"), escapeAttribute(reply));
+  appendRow(page, F("Тіло"), escapeAttribute(body) + F(" (") + strlen(body) + F(" Б)"));
+
+  // The status line was cut off above, so this only searches the headers.
+  *(body - 4) = '\0';
+  appendRow(page, F("Content-Encoding"),
+            strcasestr(lineEnd + 2, "content-encoding") ? F("Є — так бути не може")
+                                                        : F("немає"));
+}
+
+void handleProbe() {
+  // Read before the page itself takes a couple of kilobytes off the heap.
+  String idle = heapSummary();
+
+  String page;
+  page.reserve(2048);
+  page = F("<!doctype html><title>K-Clock — проба TLS</title>");
+  page += FPSTR(PageStyle);
+  page += F("<main><h1>Проба TLS</h1>");
+  appendRow(page, F("Сервер"), String(ProbeHost));
+  appendRow(page, F("Пам'ять у спокої (вільно / блок)"), idle);
+
+  // The other ceiling. With TLS linked in, the image only fits twice into the
+  // 1M layout because build.sh trims it - this row is how to see the margin
+  // the next OTA will have.
+  appendRow(page, F("Флеш: чип / в збірці"),
+            String(ESP.getFlashChipRealSize()) + F(" / ") + ESP.getFlashChipSize() + F(" Б"));
+  appendRow(page, F("Образ / вільно для OTA"),
+            String(ESP.getSketchSize()) + F(" / ") + ESP.getFreeSketchSpace() + F(" Б"));
+
+  if (!server.hasArg("run")) {
+    page += F("<p style='color:#9aa0a6;font-size:.85rem'>Тест блокує модуль на "
+              "кілька секунд.</p><p><a href='/probe?run=1'>Запустити</a></p>");
+  } else if (!haveRealTime()) {
+    page += F("<div class=warn>NTP ще не відповів — без часу сертифікат не "
+              "перевірити.</div>");
+  } else {
+    page += F("<h2>З'єднання</h2>");
+
+    BearSSL::X509List anchors(ProbeAnchors);
+    BearSSL::Session session;
+
+    {
+      BearSSL::WiFiClientSecure client;
+      if (probeConnect(page, F("Рукостискання №1"), client, anchors, session)) {
+        probeRequest(page, client);
+      }
+      client.stop();
+    }
+
+    // A resumed handshake skips the certificate and every signature check, so
+    // it shows up as several times faster rather than as a flag - the core
+    // keeps BearSSL's session parameters private.
+    {
+      BearSSL::WiFiClientSecure client;
+      probeConnect(page, F("Рукостискання №2 (та сама сесія)"), client, anchors, session);
+      client.stop();
+    }
+
+    appendRow(page, F("Пам'ять після"), heapSummary());
+    page += F("<p><a href='/probe?run=1'>Ще раз</a></p>");
+  }
+
+  page += F("<p><a href='/'>Назад</a></p></main>");
+  server.send(200, "text/html; charset=utf-8", page);
+}
+
+// --------------------------------------------------------------- discovery --
 
 // Finding the page on the home network used to mean opening the router and
 // reading its DHCP lease table, because the module announced itself nowhere.
@@ -836,11 +1023,11 @@ void startDiscovery() {
 
 // --------------------------------------------------------------------- ota --
 
-// Over the air updates fit because the sketch is around 370 KB and the 1M
-// layout leaves roughly 500 KB for one: both the running image and the
-// incoming one have to be in flash at once, which is what puts the ceiling at
-// half the chip. Watch that headroom - if the sketch ever grows past it, OTA
-// stops working and the only way back in is the cable and the GPIO0 dance.
+// Over the air updates fit only while the image stays under 512000 bytes: the
+// running image and the incoming one have to be in flash at once, and with
+// TLS linked in this one is around 499 KB. build.sh enforces the ceiling and
+// explains the options that keep it there. Past it, OTA stops working and the
+// only way back in is the cable and the GPIO0 dance.
 //
 // The portal is the safety net for the other failure. An image that cannot
 // join the network still raises K-Clock and stays reachable; only one that
@@ -932,6 +1119,7 @@ void setup() {
   server.on("/settings", handleSettings);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/quiet", HTTP_POST, handleQuiet);
+  server.on("/probe", handleProbe);
 }
 
 void loop() {
