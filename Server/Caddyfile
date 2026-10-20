@@ -7,12 +7,11 @@
 {$DOMAIN} {
 	# Load-bearing and easy to mistake for dead configuration: a 40 KB heap device must never
 	# receive a Content-Encoding it has to inflate (DESIGN.md §5 rule 3). This must stay
-	# matched to the /d/v1 prefix even if routes are added elsewhere under /d/.
-	encode zstd gzip {
-		match {
-			not path /d/*
-		}
-	}
+	# matched to the /d/v1 prefix even if routes are added elsewhere under /d/. It has to be a
+	# named request matcher: `match` inside `encode` only takes response matchers, so a
+	# `not path` there fails to adapt and Caddy refuses to start.
+	@compressible not path /d/*
+	encode @compressible zstd gzip
 
 	reverse_proxy api:8080
 }
