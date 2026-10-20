@@ -1,9 +1,11 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Security.Claims;
 using KClock.Data;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authentication.Google;
 using Microsoft.AspNetCore.Authentication.OAuth;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 
 namespace KClock.Api.Accounts;
@@ -18,10 +20,31 @@ namespace KClock.Api.Accounts;
 /// </summary>
 public static class GoogleAuthEndpoints
 {
-    public static IResult Start() =>
+    /// <summary>
+    /// Where the browser lands when the callback finishes. Nothing is mapped at "/", so that is
+    /// not the fallback.
+    /// </summary>
+    public const string DefaultReturnUrl = "/api/me";
+
+    /// <summary>
+    /// The cookie handler's LoginPath redirect appends ?ReturnUrl=, and the callback redirects
+    /// to whatever ends up in RedirectUri verbatim — so anything not provably local falls back
+    /// rather than turning this endpoint into an open redirect.
+    /// </summary>
+    public static IResult Start([FromQuery(Name = "ReturnUrl")] string? returnUrl) =>
         Results.Challenge(
-            new AuthenticationProperties { RedirectUri = "/" },
+            new AuthenticationProperties { RedirectUri = IsLocalUrl(returnUrl) ? returnUrl : DefaultReturnUrl },
             [GoogleDefaults.AuthenticationScheme]);
+
+    /// <summary>
+    /// The same rule as ASP.NET's own IsLocalUrl, which is internal: a rooted path, but not
+    /// "//host" or "/\host" (both of which browsers read as another origin), and no control
+    /// characters, which some browsers strip before resolving.
+    /// </summary>
+    private static bool IsLocalUrl([NotNullWhen(true)] string? url) =>
+        url is ['/', ..]
+        && (url.Length == 1 || url[1] is not ('/' or '\\'))
+        && !url.Any(char.IsControl);
 
     public static async Task<IResult> SignOutAsync(HttpContext http)
     {
