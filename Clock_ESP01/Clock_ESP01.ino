@@ -112,12 +112,20 @@ static const char DefaultOtaPassword[] = "k-clock";
 
 // Bumped when the struct grows, so a module carrying the older layout falls
 // back to the defaults instead of reading the new field out of stale bytes.
-static const uint32_t SettingsMagic = 0x4B434C32;  // "KCL2"
+// KCL3 only appended the token, so a KCL2 module keeps its time zone and OTA
+// password - they sit at the same offsets - and starts out unbound.
+static const uint32_t SettingsMagic = 0x4B434C33;    // "KCL3"
+static const uint32_t SettingsMagicKcl2 = 0x4B434C32;  // "KCL2"
 
 struct EspSettings {
   uint32_t magic;
   char tz[48];
   char otaPassword[33];
+  // The device's own credential from enroll: kcd1_ and 43 more characters.
+  // Empty until the module is bound, and replaced only by a successful
+  // enrollment - never cleared because the server refused it, or one bad
+  // deploy answering 401 would unbind every clock for good (DESIGN.md §5.3).
+  char token[64];
 };
 
 EspSettings settings;
@@ -179,12 +187,17 @@ void loadSettings() {
   EEPROM.begin(sizeof(EspSettings));
   EEPROM.get(0, settings);
 
-  if (settings.magic != SettingsMagic) {
+  if (settings.magic == SettingsMagicKcl2) {
+    // The bytes behind the old layout are whatever the sector held before.
+    settings.magic = SettingsMagic;
+    memset(settings.token, 0, sizeof(settings.token));
+  } else if (settings.magic != SettingsMagic) {
     settings.magic = SettingsMagic;
     strncpy(settings.tz, DefaultTz, sizeof(settings.tz) - 1);
 
     strncpy(settings.otaPassword, DefaultOtaPassword,
             sizeof(settings.otaPassword) - 1);
+    memset(settings.token, 0, sizeof(settings.token));
   }
 
   // Outside the branch on purpose. A half written commit can leave the magic
@@ -192,6 +205,7 @@ void loadSettings() {
   // touches these afterwards reads them as C strings.
   settings.tz[sizeof(settings.tz) - 1] = '\0';
   settings.otaPassword[sizeof(settings.otaPassword) - 1] = '\0';
+  settings.token[sizeof(settings.token) - 1] = '\0';
 
   // A module carrying the layout from before there was a default has a valid
   // magic word and an empty password, so the branch above never runs for it.
@@ -487,6 +501,216 @@ void pushTime() {
   timePushTime = millis();
 }
 
+// ------------------------------------------------------------------- cloud --
+
+// The device half of Server/DESIGN.md §5, so far only binding: a code typed on
+// the settings page is exchanged over TLS for this module's own token. The
+// code is short-lived because that page is plain HTTP that anyone on the home
+// network can read; the token never appears on it.
+static const char CloudHost[] = "clock.karmazin.com.ua";
+static const uint16_t CloudPort = 443;
+static const unsigned long CloudReadMs = 5000;
+
+// What the server builds this device's policy from, and the version it records
+// on enrollment - the only moment it learns one, so bump it with a release.
+static const char DeviceProfile[] = "esp8266-1m";
+static const char FwVersion[] = "2026.10.21";
+
+// Roots rather than the leaf or YE1, which Let's Encrypt reissues - a pin on
+// either would blind the clock within ninety days. Two of them, because Caddy
+// currently ends the chain on Root YE cross-signed by X2, and BearSSL stops at
+// the first certificate whose issuer is an anchor, so either one carries it
+// whichever end Caddy settles on. The probe that measured all this is gone;
+// the figures are in CLAUDE.md.
+static const char CloudAnchors[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIB2TCCAWCgAwIBAgIRAKQCa6LvbHwg1AR+XmWmk4AwCgYIKoZIzj0EAwMwLjEL
+MAkGA1UEBhMCVVMxDTALBgNVBAoTBElTUkcxEDAOBgNVBAMTB1Jvb3QgWUUwHhcN
+MjUwOTAzMDAwMDAwWhcNNDUwOTAyMjM1OTU5WjAuMQswCQYDVQQGEwJVUzENMAsG
+A1UEChMESVNSRzEQMA4GA1UEAxMHUm9vdCBZRTB2MBAGByqGSM49AgEGBSuBBAAi
+A2IABDwS/6vhrcVqcbBo+wgdI3fwn9x7DNJJOY/lTOti0vkwuRN87RhEhTH17E7X
+yFjWsPYhIPt/wzOqxTd2b+4ZJNy9ID04YywF9U5zasDVyGSNErVNtz8uSGh5izW8
+7j77GaNCMEAwDgYDVR0PAQH/BAQDAgEGMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0O
+BBYEFKPIJlqOoUzQNWP8myPIOq5W809WMAoGCCqGSM49BAMDA2cAMGQCMHhMr8N9
+LdL1VQKs9BdV81r76eXRB6mtjuNjzk6/lBsPNToWLTDzGYgtQKO1jl63uAIwGV7m
+onyF377c+MM1oqVNs17sgu7F9YKZwgLmVbeOMDbKAXHtKMDLbiGllCcs8f47
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIICGzCCAaGgAwIBAgIQQdKd0XLq7qeAwSxs6S+HUjAKBggqhkjOPQQDAzBPMQsw
+CQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2gg
+R3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMjAeFw0yMDA5MDQwMDAwMDBaFw00
+MDA5MTcxNjAwMDBaME8xCzAJBgNVBAYTAlVTMSkwJwYDVQQKEyBJbnRlcm5ldCBT
+ZWN1cml0eSBSZXNlYXJjaCBHcm91cDEVMBMGA1UEAxMMSVNSRyBSb290IFgyMHYw
+EAYHKoZIzj0CAQYFK4EEACIDYgAEzZvVn4CDCuwJSvMWSj5cz3es3mcFDR0HttwW
++1qLFNvicWDEukWVEYmO6gbf9yoWHKS5xcUy4APgHoIYOIvXRdgKam7mAHf7AlF9
+ItgKbppbd9/w+kHsOdx1ymgHDB/qo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T
+AQH/BAUwAwEB/zAdBgNVHQ4EFgQUfEKWrt5LSDv6kviejM9ti6lyN5UwCgYIKoZI
+zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW
+tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1
+/q4AaOeMSQ+2b1tbFfLn
+-----END CERTIFICATE-----
+)EOF";
+
+// A code is held here between the form and loop(), which runs the exchange
+// once the module can: online, with a real time to check the certificate
+// against, and with the clock answering, since the server takes the sensor
+// model from the first enrollment and the Nano is the only one that knows it.
+char enrollCode[17];
+bool enrollPending;
+
+// The last attempt's outcome for the status page; NULL until there is one.
+const __FlashStringHelper *enrollResult;
+int enrollHttpStatus;
+
+static String heapSummary() {
+  return String(ESP.getFreeHeap()) + F(" / ") + ESP.getMaxFreeBlockSize() +
+         F(" Б, фрагм. ") + ESP.getHeapFragmentation() + F(" %");
+}
+
+// Server/DESIGN.md §5 rule 5: every key is unique as a substring of the whole
+// contract and never occurs inside a value, so the first "key":" is the key.
+static bool jsonString(const char *json, const char *key, char *out, size_t size) {
+  char pattern[24];
+  snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+  const char *start = strstr(json, pattern);
+  if (start == NULL) {
+    return false;
+  }
+  start += strlen(pattern);
+
+  const char *end = strchr(start, '"');
+  if (end == NULL || (size_t)(end - start) >= size) {
+    return false;
+  }
+
+  memcpy(out, start, end - start);
+  out[end - start] = '\0';
+  return true;
+}
+
+// One POST on one connection, closed afterwards: Caddy resumes sessions only
+// from tickets and BearSSL only from session IDs, so a kept socket would buy
+// nothing by the next request. Blocks loop() for the handshake, ~4 s at
+// 160 MHz. Returns the HTTP status, or 0 when nothing usable came back.
+static int cloudPost(const char *path, const char *json, const char *token,
+                     char *reply, size_t replySize, char **body) {
+  BearSSL::X509List anchors(CloudAnchors);
+  BearSSL::WiFiClientSecure client;
+  client.setTrustAnchors(&anchors);
+  client.setX509Time(time(nullptr));
+
+  if (!client.connect(CloudHost, CloudPort)) {
+    return 0;
+  }
+
+  client.print(F("POST "));
+  client.print(path);
+  client.print(F(" HTTP/1.1\r\nHost: "));
+  client.print(CloudHost);
+  if (token != NULL) {
+    client.print(F("\r\nAuthorization: Bearer "));
+    client.print(token);
+  }
+  client.print(F("\r\nContent-Type: application/json\r\nContent-Length: "));
+  client.print(strlen(json));
+  client.print(F("\r\nConnection: close\r\n\r\n"));
+  client.print(json);
+
+  size_t length = 0;
+  unsigned long start = millis();
+  while (length < replySize - 1 && millis() - start < CloudReadMs &&
+         (client.connected() || client.available())) {
+    int got = client.read((uint8_t *)reply + length, replySize - 1 - length);
+    if (got > 0) {
+      length += got;
+    } else {
+      delay(10);
+    }
+  }
+  reply[length] = '\0';
+  client.stop();
+
+  // Every device response carries a Content-Length and no chunking (rule 4),
+  // and is small enough to arrive whole, so the headers need no parsing.
+  char *separator = strstr(reply, "\r\n\r\n");
+  if (strncmp(reply, "HTTP/1.", 7) != 0 || separator == NULL) {
+    return 0;
+  }
+  *body = separator + 4;
+  return atoi(reply + 9);
+}
+
+// Anything else is refused at the form, which also keeps the code safe to
+// drop into the JSON body as it is.
+static bool validEnrollCode(const String &code) {
+  if (code.length() == 0 || code.length() >= sizeof(enrollCode)) {
+    return false;
+  }
+  for (unsigned int i = 0; i < code.length(); i++) {
+    if (!isAlphaNumeric(code[i]) && code[i] != '-') {
+      return false;
+    }
+  }
+  return true;
+}
+
+static const __FlashStringHelper *describeEnrollError(int status, const char *err) {
+  if (status == 0)                       return F("немає з'єднання з сервером");
+  if (strcmp(err, "code_invalid") == 0)  return F("код невірний");
+  if (strcmp(err, "code_expired") == 0)  return F("код прострочений — створіть новий");
+  if (strcmp(err, "code_used") == 0)     return F("код уже використано — створіть новий");
+  if (strcmp(err, "slow_down") == 0)     return F("забагато спроб — зачекайте хвилину");
+  return F("сервер відмовив");
+}
+
+// No retry on failure: the code is single use and lives fifteen minutes, so a
+// refused one is spent and a fresh one has to come from the account anyway.
+void cloudEnroll() {
+  enrollPending = false;
+
+  uint8_t raw[6];
+  WiFi.macAddress(raw);
+  char mac[13];
+  snprintf(mac, sizeof(mac), "%02X%02X%02X%02X%02X%02X",
+           raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
+
+  // The Nano reports -1 for humidity on a BMP280 board.
+  char json[160];
+  snprintf(json, sizeof(json),
+           "{\"code\":\"%s\",\"hw\":\"%s\",\"fw\":\"%s\",\"mac\":\"%s\","
+           "\"model\":\"%s\",\"chip\":\"%08x\"}",
+           enrollCode, DeviceProfile, FwVersion, mac,
+           clockStatus.humidityPercent >= 0 ? "bme280" : "bmp280", ESP.getChipId());
+  memset(enrollCode, 0, sizeof(enrollCode));
+
+  char reply[1024];
+  char *body = NULL;
+  enrollHttpStatus = cloudPost("/d/v1/enroll", json, NULL, reply, sizeof(reply), &body);
+
+  char token[sizeof(settings.token)];
+  if (enrollHttpStatus == 200 && jsonString(body, "token", token, sizeof(token)) &&
+      strncmp(token, "kcd1_", 5) == 0) {
+    strcpy(settings.token, token);
+    saveSettings();
+    enrollResult = F("прив'язано");
+    return;
+  }
+
+  char err[24] = "";
+  if (body != NULL) {
+    jsonString(body, "err", err, sizeof(err));
+  }
+  enrollResult = describeEnrollError(enrollHttpStatus, err);
+}
+
+// Why a pending code has not gone out yet, for the status page.
+static const __FlashStringHelper *enrollWaitingFor() {
+  if (WiFi.status() != WL_CONNECTED) return F("чекає на мережу");
+  if (!haveRealTime())                return F("чекає на час з NTP");
+  if (!linkAlive())                   return F("чекає на годинник");
+  return F("виконується");
+}
+
 // -------------------------------------------------------------------- pages --
 
 static const char PageStyle[] PROGMEM =
@@ -536,7 +760,7 @@ static void appendRow(String &page, const __FlashStringHelper *label, const Stri
 
 void handleRoot() {
   String page;
-  page.reserve(2048);
+  page.reserve(2560);
   page = F("<!doctype html><title>K-Clock</title>");
   page += FPSTR(PageStyle);
   page += F("<main><h1>K-Clock</h1>");
@@ -575,6 +799,22 @@ void handleRoot() {
             !otaReady          ? F("вимкнено")
             : otaPasswordIsDefault() ? F("увімкнено, пароль типовий")
                                      : F("увімкнено, пароль власний"));
+
+  page += F("<h2>Хмара</h2>");
+  appendRow(page, F("Сервер"), String(CloudHost));
+  appendRow(page, F("Прив'язка"), settings.token[0] ? F("є") : F("немає"));
+
+  if (enrollPending) {
+    appendRow(page, F("Остання спроба"), enrollWaitingFor());
+  } else if (enrollResult != NULL) {
+    String result(enrollResult);
+    if (enrollHttpStatus != 0 && enrollHttpStatus != 200) {
+      result += String(F(" (HTTP ")) + enrollHttpStatus + F(")");
+    }
+    appendRow(page, F("Остання спроба"), result);
+  }
+
+  appendRow(page, F("Пам'ять (вільно / блок)"), heapSummary());
 
   page += F("<h2>Лінія до Nano</h2>");
   appendRow(page, F("Прийнято кадрів"), String(linkFramesGood));
@@ -628,6 +868,15 @@ void handleSettings() {
   page += F("<input name=ota type=password autocomplete=new-password>");
   page += F("<p style='color:#9aa0a6;font-size:.85rem'>Зміна пароля перезавантажує "
             "модуль — бібліотека приймає його лише під час запуску.</p>");
+
+  // The OTA password's convention exactly: a password box, never filled back
+  // in, blank meaning leave alone.
+  page += F("<h2>Хмара</h2>");
+  page += F("<label>Код прив'язки з акаунта (порожнє — не змінювати; ");
+  page += settings.token[0] ? F("зараз прив'язано)</label>") : F("зараз не прив'язано)</label>");
+  page += F("<input name=code type=password autocomplete=off>");
+  page += F("<p style='color:#9aa0a6;font-size:.85rem'>Код живе 15 хвилин. Нова "
+            "прив'язка забирає годинник у попереднього власника.</p>");
 
   page += F("<h2>Годинник</h2>");
 
@@ -751,6 +1000,22 @@ void handleSave() {
     saveSettings();
   }
 
+  // Only queued here. The exchange takes a TLS handshake, and the browser is
+  // owed its redirect first; loop() runs it once the module is able to.
+  String code = server.arg("code");
+  code.trim();
+  if (code.length() > 0) {
+    if (validEnrollCode(code)) {
+      strncpy(enrollCode, code.c_str(), sizeof(enrollCode) - 1);
+      enrollCode[sizeof(enrollCode) - 1] = '\0';
+      enrollPending = true;
+    } else {
+      enrollPending = false;
+      enrollHttpStatus = 0;
+      enrollResult = F("код має вигляд XXXX-XXXX");
+    }
+  }
+
   // Spaced out on purpose - each sendConfig ends in a short delay. Three frames
   // back to back are around sixty bytes, which is the whole of the Nano's
   // hardware receive buffer, and it only drains between passes of loop().
@@ -814,192 +1079,6 @@ void handleQuiet() {
 
   server.sendHeader("Location", "/");
   server.send(303);
-}
-
-// ------------------------------------------------------------------- probe --
-
-// Temporary: step one of Server/DESIGN.md §14, which gates the whole cloud
-// client. A BearSSL handshake wants a 16-22 KB contiguous block, and nobody has
-// yet looked at how much is left with the portal, the web server, OTA and three
-// name responders all resident - so this runs inside the real firmware rather
-// than a bare sketch, which would have shown a heap this module never has.
-//
-// It blocks loop() for the seconds a handshake takes. That costs a status poll
-// or two, well inside LinkStaleMs, and it is only ever run by hand.
-static const char ProbeHost[] = "clock.karmazin.com.ua";
-static const uint16_t ProbePort = 443;
-static const unsigned long ProbeReadMs = 5000;
-
-// Two anchors, so the result does not depend on which chain Caddy happens to
-// send: it currently serves leaf, YE1, Root YE cross-signed by X2, and X2
-// cross-signed by X1. BearSSL stops at the first certificate whose issuer is an
-// anchor, so either one carries the chain. Roots rather than the leaf or YE1,
-// because Let's Encrypt reissues those and a fingerprint pin would blind the
-// clock within ninety days.
-static const char ProbeAnchors[] PROGMEM = R"EOF(
------BEGIN CERTIFICATE-----
-MIIB2TCCAWCgAwIBAgIRAKQCa6LvbHwg1AR+XmWmk4AwCgYIKoZIzj0EAwMwLjEL
-MAkGA1UEBhMCVVMxDTALBgNVBAoTBElTUkcxEDAOBgNVBAMTB1Jvb3QgWUUwHhcN
-MjUwOTAzMDAwMDAwWhcNNDUwOTAyMjM1OTU5WjAuMQswCQYDVQQGEwJVUzENMAsG
-A1UEChMESVNSRzEQMA4GA1UEAxMHUm9vdCBZRTB2MBAGByqGSM49AgEGBSuBBAAi
-A2IABDwS/6vhrcVqcbBo+wgdI3fwn9x7DNJJOY/lTOti0vkwuRN87RhEhTH17E7X
-yFjWsPYhIPt/wzOqxTd2b+4ZJNy9ID04YywF9U5zasDVyGSNErVNtz8uSGh5izW8
-7j77GaNCMEAwDgYDVR0PAQH/BAQDAgEGMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0O
-BBYEFKPIJlqOoUzQNWP8myPIOq5W809WMAoGCCqGSM49BAMDA2cAMGQCMHhMr8N9
-LdL1VQKs9BdV81r76eXRB6mtjuNjzk6/lBsPNToWLTDzGYgtQKO1jl63uAIwGV7m
-onyF377c+MM1oqVNs17sgu7F9YKZwgLmVbeOMDbKAXHtKMDLbiGllCcs8f47
------END CERTIFICATE-----
------BEGIN CERTIFICATE-----
-MIICGzCCAaGgAwIBAgIQQdKd0XLq7qeAwSxs6S+HUjAKBggqhkjOPQQDAzBPMQsw
-CQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2gg
-R3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMjAeFw0yMDA5MDQwMDAwMDBaFw00
-MDA5MTcxNjAwMDBaME8xCzAJBgNVBAYTAlVTMSkwJwYDVQQKEyBJbnRlcm5ldCBT
-ZWN1cml0eSBSZXNlYXJjaCBHcm91cDEVMBMGA1UEAxMMSVNSRyBSb290IFgyMHYw
-EAYHKoZIzj0CAQYFK4EEACIDYgAEzZvVn4CDCuwJSvMWSj5cz3es3mcFDR0HttwW
-+1qLFNvicWDEukWVEYmO6gbf9yoWHKS5xcUy4APgHoIYOIvXRdgKam7mAHf7AlF9
-ItgKbppbd9/w+kHsOdx1ymgHDB/qo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T
-AQH/BAUwAwEB/zAdBgNVHQ4EFgQUfEKWrt5LSDv6kviejM9ti6lyN5UwCgYIKoZI
-zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW
-tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1
-/q4AaOeMSQ+2b1tbFfLn
------END CERTIFICATE-----
-)EOF";
-
-static String heapSummary() {
-  return String(ESP.getFreeHeap()) + F(" / ") + ESP.getMaxFreeBlockSize() +
-         F(" Б, фрагм. ") + ESP.getHeapFragmentation() + F(" %");
-}
-
-// One handshake, timed, with the heap read while the connection still holds
-// its buffers - that is the figure the real client will live with.
-//
-// There is no MFLN probe: Caddy's Go TLS stack does not implement it, so the
-// buffers stay at the default 16 KB, and the probe cost 1.3 KB of the flash
-// budget to confirm that on every run.
-static bool probeConnect(String &page, const __FlashStringHelper *label,
-                         BearSSL::WiFiClientSecure &client,
-                         BearSSL::X509List &anchors, BearSSL::Session &session) {
-  client.setTrustAnchors(&anchors);
-  client.setX509Time(time(nullptr));
-  client.setSession(&session);
-
-  unsigned long start = millis();
-  bool ok = client.connect(ProbeHost, ProbePort);
-  unsigned long elapsed = millis() - start;
-
-  if (ok) {
-    appendRow(page, label, String(elapsed) + F(" мс"));
-    appendRow(page, F("Пам'ять під час з'єднання"), heapSummary());
-  } else {
-    char reason[64];
-    int code = client.getLastSSLError(reason, sizeof(reason));
-    appendRow(page, label,
-              String(F("помилка ")) + code + F(": ") + escapeAttribute(reason) +
-              F(" (") + elapsed + F(" мс)"));
-  }
-
-  return ok;
-}
-
-// An empty enroll is the device path end to end with no side effect: the
-// server answers 400 bad_request before touching the database. What matters is
-// that a reply arrives at all, how large it is, and that it is not encoded.
-static void probeRequest(String &page, BearSSL::WiFiClientSecure &client) {
-  client.print(F("POST /d/v1/enroll HTTP/1.1\r\nHost: "));
-  client.print(ProbeHost);
-  client.print(F("\r\nContent-Type: application/json\r\nContent-Length: 2\r\n"
-                 "Connection: close\r\n\r\n{}"));
-
-  char reply[768];
-  size_t length = 0;
-  unsigned long start = millis();
-
-  while (length < sizeof(reply) - 1 && millis() - start < ProbeReadMs &&
-         (client.connected() || client.available())) {
-    int got = client.read((uint8_t *)reply + length, sizeof(reply) - 1 - length);
-    if (got > 0) {
-      length += got;
-    } else {
-      delay(10);
-    }
-  }
-  reply[length] = '\0';
-
-  char *lineEnd = strstr(reply, "\r\n");
-  char *body = strstr(reply, "\r\n\r\n");
-  if (lineEnd == NULL || body == NULL) {
-    appendRow(page, F("Відповідь"), String(F("неповна, ")) + length + F(" Б"));
-    return;
-  }
-
-  *lineEnd = '\0';
-  body += 4;
-
-  appendRow(page, F("Статус"), escapeAttribute(reply));
-  appendRow(page, F("Тіло"), escapeAttribute(body) + F(" (") + strlen(body) + F(" Б)"));
-
-  // The status line was cut off above, so this only searches the headers.
-  *(body - 4) = '\0';
-  appendRow(page, F("Content-Encoding"),
-            strcasestr(lineEnd + 2, "content-encoding") ? F("Є — так бути не може")
-                                                        : F("немає"));
-}
-
-void handleProbe() {
-  // Read before the page itself takes a couple of kilobytes off the heap.
-  String idle = heapSummary();
-
-  String page;
-  page.reserve(2048);
-  page = F("<!doctype html><title>K-Clock — проба TLS</title>");
-  page += FPSTR(PageStyle);
-  page += F("<main><h1>Проба TLS</h1>");
-  appendRow(page, F("Сервер"), String(ProbeHost));
-  appendRow(page, F("Пам'ять у спокої (вільно / блок)"), idle);
-
-  // The other ceiling. With TLS linked in, the image only fits twice into the
-  // 1M layout because build.sh trims it - this row is how to see the margin
-  // the next OTA will have.
-  appendRow(page, F("Флеш: чип / в збірці"),
-            String(ESP.getFlashChipRealSize()) + F(" / ") + ESP.getFlashChipSize() + F(" Б"));
-  appendRow(page, F("Образ / вільно для OTA"),
-            String(ESP.getSketchSize()) + F(" / ") + ESP.getFreeSketchSpace() + F(" Б"));
-
-  if (!server.hasArg("run")) {
-    page += F("<p style='color:#9aa0a6;font-size:.85rem'>Тест блокує модуль на "
-              "кілька секунд.</p><p><a href='/probe?run=1'>Запустити</a></p>");
-  } else if (!haveRealTime()) {
-    page += F("<div class=warn>NTP ще не відповів — без часу сертифікат не "
-              "перевірити.</div>");
-  } else {
-    page += F("<h2>З'єднання</h2>");
-
-    BearSSL::X509List anchors(ProbeAnchors);
-    BearSSL::Session session;
-
-    {
-      BearSSL::WiFiClientSecure client;
-      if (probeConnect(page, F("Рукостискання №1"), client, anchors, session)) {
-        probeRequest(page, client);
-      }
-      client.stop();
-    }
-
-    // A resumed handshake skips the certificate and every signature check, so
-    // it shows up as several times faster rather than as a flag - the core
-    // keeps BearSSL's session parameters private.
-    {
-      BearSSL::WiFiClientSecure client;
-      probeConnect(page, F("Рукостискання №2 (та сама сесія)"), client, anchors, session);
-      client.stop();
-    }
-
-    appendRow(page, F("Пам'ять після"), heapSummary());
-    page += F("<p><a href='/probe?run=1'>Ще раз</a></p>");
-  }
-
-  page += F("<p><a href='/'>Назад</a></p></main>");
-  server.send(200, "text/html; charset=utf-8", page);
 }
 
 // --------------------------------------------------------------- discovery --
@@ -1135,7 +1214,6 @@ void setup() {
   server.on("/settings", handleSettings);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/quiet", HTTP_POST, handleQuiet);
-  server.on("/probe", handleProbe);
 }
 
 void loop() {
@@ -1188,6 +1266,12 @@ void loop() {
 
   if (online && !timeSynced && haveRealTime()) {
     timeSynced = true;
+  }
+
+  // After handleClient(), so the save that queued the code has already had its
+  // redirect; the page it lands on waits out the handshake and shows the result.
+  if (enrollPending && online && haveRealTime() && linkAlive()) {
+    cloudEnroll();
   }
 
   // The first push happens as soon as there is a real time to push; after that

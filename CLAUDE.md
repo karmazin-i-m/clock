@@ -272,8 +272,8 @@ short press. That is why the screens jumped in bursts.
 The ESP-01 is a peripheral on the hardware UART at 9600 baud. It owns nothing on the panel;
 pull it out and the clock behaves exactly as it did before. `Clock_ESP01/Clock_ESP01.ino` runs
 WiFiManager's captive portal, an NTP client, and a small web server for the status and
-settings pages. Credentials need no filesystem — the SDK keeps them itself — and the only
-thing the ESP stores of its own is the time zone string, in emulated EEPROM.
+settings pages. Credentials need no filesystem — the SDK keeps them itself — and what the ESP
+stores of its own is the time zone, the OTA password and the cloud token, in emulated EEPROM.
 
 **The transport had to be the hardware UART.** `SoftwareSerial` on one of the free pins
 (D8–D13, A0–A3) is not an option: the Timer1 ISR spends ~38 µs twice every 500 µs, which is a
@@ -370,9 +370,10 @@ password rather than as a refusal. Changing the password restarts the module, be
 the incoming one are both in flash during an update, and the `Updater` wants
 `roundup4K(running) + roundup4K(incoming) <= 0xFB000` — 251 sectors, so two images of the same
 size get 125 each. Past that, OTA fails on the module with nothing to explain it. Linking
-BearSSL for the `/probe` page (Server/DESIGN.md §4) took the image from 409 KB to 528 KB, +118 KB
-rather than the 50-80 KB the design estimated, which would flash once over the plain firmware
-and never again over itself. `build.sh` gets it back to ~499 KB with three options, measured on
+BearSSL (Server/DESIGN.md §4) took the image from 409 KB to 528 KB, +118 KB rather than the
+50-80 KB the design estimated, which would flash once over the plain firmware and never again
+over itself. `build.sh` gets it back under the ceiling with three options - ~494 KB with the
+binding client, leaving ~18 KB for telemetry - measured on
 core 3.1.2: `build.float=` drops the `-u _printf_float -u _scanf_float` the core forces (-17 KB;
 nothing here formats a float through `printf`, and `String(float)` goes through `dtostrf`, which
 does not need it), `-DWM_NODEBUG` drops WiFiManager's log strings (-11 KB, its output was already
@@ -385,7 +386,8 @@ roughly 35 KB, since `WiFiClientSecure` links every suite and RSA whatever `setC
 Recovery from a bad image is the portal — `autoConnect` raises `K-Clock` when it cannot join —
 and only an image that crashes earlier than that needs the cable.
 
-**What the probe measured** on the real module, with everything above resident: ~43 KB free and
+**What the TLS probe measured** - a temporary `/probe` page, since replaced by the client
+below - on the real module, with everything above resident: ~43 KB free and
 a 30-43 KB largest block at idle, ~12 KB free and a 6-12 KB block while a connection holds its
 buffers. The handshake is a full one every time, 8.0 s at 80 MHz and 4.0 s at 160 MHz - pure
 ECDSA arithmetic over a P-384 chain, which is why the clock speed halves it exactly. There is
@@ -393,6 +395,21 @@ no session resumption to be had: Caddy's Go TLS stack resumes TLS 1.2 only from 
 tickets, and BearSSL only from session IDs. MFLN is refused too, so the buffers stay at 16 KB.
 The anchors are ISRG Root YE and ISRG Root X2, so the chain validates whichever of the two
 Caddy ends it on.
+
+**Binding to the cloud is a code exchanged for a token** (Server/DESIGN.md §5.1). A code
+created in the account goes into the settings page, `handleSave()` only queues it, and
+`loop()` runs `cloudEnroll()` once the module is online, has an NTP time to check the
+certificate against, and hears the clock — the server takes the sensor model from the first
+enrollment, and only the Nano knows it (-1 humidity means `bmp280`). The page the save
+redirects to therefore waits out the ~4 s handshake and shows the result. There is no retry:
+the code is single use and lives fifteen minutes, so a refused one is spent anyway.
+`cloudPost()` is the one HTTPS call, a fresh connection per request with `Connection: close`,
+and the replies are read with `strstr` rather than a JSON library, which contract rule 5
+(every key unique as a substring) exists to allow. The token lives in EEPROM layout `KCL3`,
+which only appended it, so a `KCL2` module keeps its other settings and starts unbound. It is
+replaced only by a successful enrollment and never cleared because the server refused it —
+the 401 rule in §5.3 — and it never appears on a page; the status page says only whether one is
+held. `FwVersion` is what the server records, and only at enrollment, so bump it with a release.
 
 **Going quiet means leaving the wire, not just stopping the data.** This is the whole point and
 it was got wrong once: a UART transmit pin is a push-pull output idling high, so an ESP that
