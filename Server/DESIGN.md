@@ -96,6 +96,13 @@ design has to respect the limits rather than wish them away.
 
 ### Step zero, before any server code
 
+> **Done on 2026-10-21, and the profile survives.** Idle heap ~43 KB with a 30-43 KB largest
+> block; ~12 KB left while a connection is open. No MFLN and **no session resumption**: Caddy
+> resumes only from tickets, BearSSL only from session IDs, so every flush is a full handshake —
+> 4.0 s at 160 MHz. The figure that actually bit was flash: +118 KB for BearSSL, not 50-80, and
+> the image only fits the OTA ceiling twice after trimming. The numbers and the trims are in the
+> repository's CLAUDE.md, under the ESP-01 link.
+
 Flash a throwaway sketch that brings up the existing web server, prints
 `ESP.getFreeHeap()` and `ESP.getMaxFreeBlockSize()`, and attempts one real TLS handshake
 with a single trust anchor. **If the largest free block is under ~18 KB, the `esp8266-1m`
