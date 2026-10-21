@@ -14,19 +14,30 @@ using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Prometheus;
+using IPNetwork = System.Net.IPNetwork;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Must run before anything else touches Request.Scheme — behind Caddy it is otherwise "http",
 // and any redirect_uri built from it (including Google's) is wrong (Ops papercut, DESIGN.md
-// §12). KnownIPNetworks/KnownProxies are cleared rather than left at their (loopback-only)
-// default because Caddy reaches the API over the compose network, not localhost; otherwise the
-// headers are silently ignored.
+// §12). Caddy does not reach the API over localhost, so the loopback-only default would ignore
+// the headers — but clearing the lists outright trusts them from anyone who can reach the port,
+// who then picks their own RemoteIpAddress and with it their own enrollment rate-limit bucket.
+// ReverseProxy:TrustedProxies names Caddy instead: comma separated addresses or CIDR networks.
+// Unset keeps the loopback-only default. Parsed here so a typo fails the start, not a request.
+var trustedProxies = (builder.Configuration["ReverseProxy:TrustedProxies"] ?? "")
+    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+    .Select(entry => IPNetwork.Parse(entry.Contains('/') ? entry : $"{entry}/{(entry.Contains(':') ? 128 : 32)}"))
+    .ToList();
 builder.Services.Configure<ForwardedHeadersOptions>(options =>
 {
     options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
-    options.KnownIPNetworks.Clear();
-    options.KnownProxies.Clear();
+    if (trustedProxies.Count > 0)
+    {
+        options.KnownIPNetworks.Clear();
+        options.KnownProxies.Clear();
+        trustedProxies.ForEach(options.KnownIPNetworks.Add);
+    }
 });
 
 // Persisted to a named volume with an explicit SetApplicationName — the default path inside

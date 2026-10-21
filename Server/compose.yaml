@@ -44,6 +44,8 @@ services:
       Authentication__Google__ClientSecret: "${GOOGLE_CLIENT_SECRET}"
       DataProtectionKeysPath: "${DATA_PROTECTION_KEYS_PATH}"
       OpenApi__Enabled: "${OPENAPI_ENABLED:-false}"
+      # Caddy reaches the API over the compose bridge, whose subnet Docker picks from this range.
+      ReverseProxy__TrustedProxies: "172.16.0.0/12"
     volumes:
       - dp-keys:${DATA_PROTECTION_KEYS_PATH}
     depends_on:

@@ -865,8 +865,10 @@ Three deploy-day papercuts whose symptoms point the wrong way:
    `SetApplicationName`. The symptom reads as an auth bug and is not.
 2. **Forwarded headers.** Behind Caddy, `Request.Scheme` is `http`, so the Google
    `redirect_uri` is built as `http://` and Google rejects it. `UseForwardedHeaders` must
-   be the *first* middleware, with `KnownNetworks`/`KnownProxies` cleared or set to the
-   Docker subnet — otherwise it silently ignores the headers.
+   be the *first* middleware, and Caddy's address must be in `ReverseProxy:TrustedProxies` —
+   otherwise it silently ignores the headers. Never clear the lists instead: that trusts the
+   headers from anyone who can reach the port, who then chooses their own client address and
+   with it their own enrollment rate-limit bucket.
 3. **Caddy `encode` must exclude `/d/*`**, and `key_type p256` must be set for the ECDSA
    chain. Both look like noise and are load-bearing.
 
