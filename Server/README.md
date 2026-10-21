@@ -86,9 +86,59 @@ a dropped connection. It now returns an `IResult`.
 - A Google Cloud OAuth 2.0 Web client (client id + secret), with redirect URI
   `https://<DOMAIN>/auth/google/callback` registered in the Google Cloud Console first.
 - A real domain pointed at the deploy target, for Caddy's automatic TLS.
-- Docker + Docker Compose on the deploy target.
-- Chosen passwords for `clock_migrator` / `clock_app` / `clock_ingest` and the Postgres
-  superuser, in a `.env` copied from `.env.example` (gitignored, never commit it).
+- A PostgreSQL with TimescaleDB, and the three roles `db/init/00_bootstrap.sql` creates.
+- An API host: a plain LXC (below), or Docker Compose for a local stack, whose passwords go in
+  a `.env` copied from `.env.example` (gitignored, never commit it).
+
+## Deploying to a plain LXC
+
+Production runs without Docker: PostgreSQL 18 + TimescaleDB in one LXC (192.168.23.8), the API
+as a systemd service in another (192.168.23.51), Caddy in a third. `deploy/deploy.sh` builds
+self-contained binaries on the workstation and installs them, so the API host carries no SDK,
+no .NET runtime and no checkout.
+
+**Database host, once.** TimescaleDB comes from Timescale's own apt repository
+(`packagecloud.io/timescale/timescaledb`, package `timescaledb-2-postgresql-18`): Debian's
+`timescaledb` package is the Apache build, without the compression the migrations enable —
+check `SHOW timescaledb.license` reads `timescale`. Preload it with
+`ALTER SYSTEM SET shared_preload_libraries = 'timescaledb'` rather than `timescaledb-tune`,
+which also rewrites the memory settings of every other database on the server. Then
+`createdb kclock` and run `db/init/00_bootstrap.sql` into it with psql as `postgres`, with the
+three `CLOCK_*_PASSWORD` variables exported — it reads them with `\getenv`. `pg_hba.conf` lets
+the three roles into `kclock` from the API host only:
+
+```
+host  kclock  clock_migrator,clock_app,clock_ingest  192.168.23.51/32  scram-sha-256
+```
+
+PostgreSQL takes the first matching line, so this must sit above any broader `host all all`
+rule — a Community Scripts install ships with `0.0.0.0/0`, which should go altogether.
+
+**API host, once** (Debian 13, as root):
+
+```bash
+apt install -y libicu76 ca-certificates tzdata rsync curl
+useradd --system --home /var/lib/kclock --shell /usr/sbin/nologin kclock
+install -d -o kclock -g kclock -m 700 /var/lib/kclock/dp-keys
+install -d -m 755 /opt/kclock /etc/kclock
+# /etc/kclock/kclock.env from deploy/kclock.env.example, mode 600
+# /etc/kclock/migrator.conn, mode 600, one line:
+#   Host=192.168.23.8;Database=kclock;Username=clock_migrator;Password=...
+```
+
+**Every deploy**, from the workstation with an SSH key on the API host:
+
+```bash
+Server/deploy/deploy.sh            # or: deploy.sh <host>, or KCLOCK_HOST=<host>
+```
+
+It runs the migrations before it replaces the API, so a failed migration leaves the old
+version running; it installs `deploy/kclock-api.service` each time, so the unit is edited in
+the repo and never on the host; and it fails unless `/health/ready` answers within 20 s.
+
+In Proxmox, start the database container first (`--startup order=1,up=30`, the API
+`order=2`), and firewall port 8080 to the Caddy host: the API trusts `X-Forwarded-*` only
+from `ReverseProxy__TrustedProxies`, but nothing else should be reaching it either.
 
 ## A few judgment calls this implementation made that DESIGN.md doesn't spell out
 

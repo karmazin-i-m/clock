@@ -32,7 +32,7 @@ public sealed class PostgresFixture : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        _container = new PostgreSqlBuilder("timescale/timescaledb-ha:pg17")
+        _container = new PostgreSqlBuilder("timescale/timescaledb-ha:pg18")
             .WithDatabase("kclock")
             .WithUsername("postgres")
             .WithPassword("postgres")

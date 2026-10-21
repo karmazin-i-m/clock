@@ -1,0 +1,23 @@
+# Installed to /etc/systemd/system/ by deploy.sh on every deploy, so this file is the source
+# of truth: edit it here, never on the host.
+[Unit]
+Description=K-Clock API
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=kclock
+# Read by systemd itself before it drops to User=, so the file stays 600 root.
+EnvironmentFile=/etc/kclock/kclock.env
+WorkingDirectory=/opt/kclock/api
+ExecStart=/opt/kclock/api/KClock.Api
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/kclock
+
+[Install]
+WantedBy=multi-user.target
