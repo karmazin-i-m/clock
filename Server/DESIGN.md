@@ -802,6 +802,28 @@ already ignored for the Atmel builds, but `bin/` and `obj/` are not.
 `GET /api/me`, `GET /api/devices`, `GET /api/devices/{id}`, `PATCH /api/devices/{id}`,
 `DELETE /api/devices/{id}/binding`, `POST|GET|DELETE /api/enrollment-codes`.
 
+The cabinet (`design/`) added the read side the SPA needs, all of it under the same account
+scope and read only through the `*_by_account` views:
+
+- `GET /api/devices/{id}/summary` — min/max of the last 24 h, and readings held.
+- `GET /api/devices/{id}/series?metric=temp|pressure|humidity&period=day|week|month|year` —
+  10 min buckets off the raw view for a day, hourly-aggregate buckets (1 h, 3 h, 1 day) beyond
+  that, aligned to the binding's zone. Only buckets holding data are sent, with a `null` point
+  between two that are more than a bucket and a half apart: the chart breaks its line there and
+  never interpolates.
+- `GET /api/history`, `GET /api/history/{bindingId}`, `GET /api/history/{bindingId}/series` —
+  former clocks, addressed by **binding**, because after A → B → A one device id names two
+  periods.
+- `/api/devices` items also carry `fw_version`, `last_seen_at`, `last` and the pressure trend,
+  computed by the firmware's own rule (±1 mm against the oldest reading in the last 3 h).
+
+Every telemetry query is narrowed to one binding as well as by RLS. RLS alone would draw both
+of an A → B → A owner's periods on the current chart.
+
+The browser API is snake_case in both directions (`ConfigureHttpJsonOptions`), and an
+unauthenticated `/api/*` call answers 401 rather than redirecting to Google, which a `fetch()`
+cannot follow.
+
 Two modelling points that matter:
 
 - **There is no `DELETE /api/devices/{id}`.** The `device` row is global, outlives every

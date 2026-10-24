@@ -49,6 +49,12 @@ builder.Services.AddDataProtection()
         builder.Configuration["DataProtectionKeysPath"] ?? "/data/dp-keys"));
 
 builder.Services.AddSingleton(TimeProvider.System);
+
+// The browser API speaks snake_case both ways, like every DTO it already wrote by hand. Without
+// this a PATCH body's display_name never binds to DisplayName and is silently ignored. The
+// device contract is untouched: every one of its records names its keys explicitly.
+builder.Services.ConfigureHttpJsonOptions(options =>
+    options.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower);
 builder.Services.AddHttpContextAccessor();
 
 // clock_app and clock_ingest are separate Postgres roles reached through separate
@@ -82,6 +88,12 @@ builder.Services
         options.LoginPath = "/auth/google/start";
         options.ExpireTimeSpan = TimeSpan.FromDays(30);
         options.SlidingExpiration = true;
+
+        // A fetch() from the SPA cannot follow a 302 to accounts.google.com — it would get
+        // Google's HTML back as the answer to /api/devices. Under /api the challenge is a
+        // plain 401, and the SPA sends the whole page to sign in.
+        options.Events.OnRedirectToLogin = context => ApiAwareRedirect(context, StatusCodes.Status401Unauthorized);
+        options.Events.OnRedirectToAccessDenied = context => ApiAwareRedirect(context, StatusCodes.Status403Forbidden);
     })
     .AddGoogle(options =>
     {
@@ -89,6 +101,7 @@ builder.Services
         options.ClientSecret = builder.Configuration["Authentication:Google:ClientSecret"] ?? string.Empty;
         options.CallbackPath = "/auth/google/callback";
         options.SaveTokens = false;
+        options.ClaimActions.MapJsonKey(AccountClaimTypes.Picture, "picture");
         options.Events.OnCreatingTicket = GoogleAuthEndpoints.OnCreatingTicketAsync;
     })
     .AddScheme<AuthenticationSchemeOptions, DeviceTokenAuthenticationHandler>(
@@ -189,13 +202,32 @@ apiGroup.MapPost("/auth/signout", (Delegate)GoogleAuthEndpoints.SignOutAsync);
 apiGroup.MapGet("/me", MeEndpoint.HandleAsync);
 apiGroup.MapGet("/devices", DevicesEndpoints.ListAsync);
 apiGroup.MapGet("/devices/{id:long}", DevicesEndpoints.GetAsync);
+apiGroup.MapGet("/devices/{id:long}/summary", DevicesEndpoints.SummaryAsync);
+apiGroup.MapGet("/devices/{id:long}/series", DevicesEndpoints.SeriesAsync);
 apiGroup.MapPatch("/devices/{id:long}", DevicesEndpoints.UpdateAsync);
 apiGroup.MapDelete("/devices/{id:long}/binding", DevicesEndpoints.UnbindAsync);
+apiGroup.MapGet("/history", HistoryEndpoints.ListAsync);
+apiGroup.MapGet("/history/{bindingId:long}", HistoryEndpoints.GetAsync);
+apiGroup.MapGet("/history/{bindingId:long}/series", HistoryEndpoints.SeriesAsync);
 apiGroup.MapPost("/enrollment-codes", EnrollmentCodesEndpoints.CreateAsync);
 apiGroup.MapGet("/enrollment-codes", EnrollmentCodesEndpoints.ListAsync);
 apiGroup.MapDelete("/enrollment-codes", EnrollmentCodesEndpoints.DeleteUnconsumedAsync);
 
 app.Run();
+
+static Task ApiAwareRedirect(RedirectContext<CookieAuthenticationOptions> context, int apiStatus)
+{
+    if (context.Request.Path.StartsWithSegments("/api"))
+    {
+        context.Response.StatusCode = apiStatus;
+    }
+    else
+    {
+        context.Response.Redirect(context.RedirectUri);
+    }
+
+    return Task.CompletedTask;
+}
 
 // WebApplicationFactory<Program> needs this to see the top-level statements above as a type.
 public partial class Program;

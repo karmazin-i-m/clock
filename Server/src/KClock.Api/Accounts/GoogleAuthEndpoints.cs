@@ -21,10 +21,10 @@ namespace KClock.Api.Accounts;
 public static class GoogleAuthEndpoints
 {
     /// <summary>
-    /// Where the browser lands when the callback finishes. Nothing is mapped at "/", so that is
-    /// not the fallback.
+    /// Where the browser lands when the callback finishes: the cabinet's list of clocks, which
+    /// is the page HANDOFF §5 sends a fresh sign-in to.
     /// </summary>
-    public const string DefaultReturnUrl = "/api/me";
+    public const string DefaultReturnUrl = "/clocks";
 
     /// <summary>
     /// The cookie handler's LoginPath redirect appends ?ReturnUrl=, and the callback redirects

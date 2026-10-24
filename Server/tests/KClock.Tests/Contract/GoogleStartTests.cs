@@ -26,13 +26,13 @@ public class GoogleStartTests(PostgresFixture fixture) : IDisposable
     [InlineData("/api/me", "/api/me")]
     [InlineData("/swagger/index.html?x=1", "/swagger/index.html?x=1")]
     [InlineData("/", "/")]
-    [InlineData(null, "/api/me")]
-    [InlineData("", "/api/me")]
-    [InlineData("https://evil.example/", "/api/me")]
-    [InlineData("//evil.example/", "/api/me")]
-    [InlineData("/\\evil.example/", "/api/me")]
-    [InlineData("api/me", "/api/me")]
-    [InlineData("/api/me\n", "/api/me")]
+    [InlineData(null, "/clocks")]
+    [InlineData("", "/clocks")]
+    [InlineData("https://evil.example/", "/clocks")]
+    [InlineData("//evil.example/", "/clocks")]
+    [InlineData("/\\evil.example/", "/clocks")]
+    [InlineData("api/me", "/clocks")]
+    [InlineData("/api/me\n", "/clocks")]
     public async Task Start_CarriesOnlyLocalReturnUrlThroughGoogle(string? returnUrl, string expected)
     {
         var client = _factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });

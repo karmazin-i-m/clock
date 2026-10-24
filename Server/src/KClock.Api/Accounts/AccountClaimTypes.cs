@@ -8,4 +8,9 @@ public static class AccountClaimTypes
     /// separate, provider-scoped identifier (DESIGN.md §7's external_login table).
     /// </summary>
     public const string AccountId = "kclock:account_id";
+
+    /// <summary>
+    /// Google's userinfo "picture", which AddGoogle does not map by default.
+    /// </summary>
+    public const string Picture = "urn:google:picture";
 }
