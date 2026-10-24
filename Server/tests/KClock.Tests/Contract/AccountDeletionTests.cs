@@ -34,9 +34,9 @@ public class AccountDeletionTests(PostgresFixture fixture) : CabinetTestBase(fix
         }
 
         // Materialise the buckets first: the purge must remove them, not merely the raw rows
-        // they were computed from (DESIGN.md §10). Only up to where the purge itself would
-        // stop, three hours back; nothing in production materialises closer than that.
-        await ExecuteAsMigratorAsync("CALL refresh_continuous_aggregate('telemetry_1h', NULL, date_trunc('hour', now() - INTERVAL '3 hours'))");
+        // they were computed from (DESIGN.md §10). Only up to the refresh policy's end_offset,
+        // an hour back, where both the policy and the purge stop.
+        await ExecuteAsMigratorAsync("CALL refresh_continuous_aggregate('telemetry_1h', NULL, date_trunc('hour', now() - INTERVAL '1 hour'))");
         Assert.True(await CountAsync("SELECT count(*) FROM telemetry_1h WHERE binding_id = @b", binding) > 0);
 
         var browser = _factory.CreateSessionClient(doomed);

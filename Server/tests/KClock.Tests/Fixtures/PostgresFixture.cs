@@ -39,6 +39,10 @@ public sealed class PostgresFixture : IAsyncLifetime
             .WithEnvironment("CLOCK_MIGRATOR_PASSWORD", MigratorPassword)
             .WithEnvironment("CLOCK_APP_PASSWORD", AppPassword)
             .WithEnvironment("CLOCK_INGEST_PASSWORD", IngestPassword)
+            // No job scheduler: the aggregate's refresh policy would otherwise move its
+            // watermark whenever it happened to run, and a row a test inserts below the
+            // watermark is invisible until the next refresh. Tests run a job when they mean to.
+            .WithCommand("-c", "timescaledb.max_background_workers=0")
             .Build();
 
         await _container.StartAsync();

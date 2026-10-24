@@ -747,11 +747,21 @@ run inside a transaction block.
 Phase 2 is `purge_telemetry`, a TimescaleDB job every five minutes rather than code in the API:
 `refresh_continuous_aggregate` cannot run in a transaction block, which a job procedure is not
 in, and the job runs as `clock_migrator`, so the API gains no role that may delete telemetry. It
-refreshes the aggregate per deleted (binding, chunk) slice, but **never within three hours of
-now**: `telemetry_1h` has no refresh policy, so whatever a refresh materialises is never
-revisited, and a late sample from any other clock landing in such a bucket (up to
-`ingest_max_lateness` later) would be lost from every chart. Recent buckets need no refresh
-anyway — nothing materialised them, so they are computed live from the rows just deleted.
+refreshes the aggregate per deleted (binding, chunk) slice, but never past the refresh
+policy's `end_offset`, an hour back: refreshing into the live hour would move the watermark
+there, and samples arriving after it would sit invisible as invalidations until the policy
+caught up.
+
+**The refresh policy** came later than the view, in the `TelemetryHourlyRefreshPolicy`
+migration: every 30 minutes, `end_offset` one hour, and `start_offset` **NULL**, the whole
+history. A finite start offset looks cheaper and is a trap: real-time aggregation covers
+only what lies above the watermark, so the first run would lift the watermark over history
+it never materialised, and that history would vanish from every chart. NULL costs nothing
+once caught up, because a refresh recomputes only invalidated buckets — a late sample, a
+purged range — wherever in history they are. Until the policy runs, a late sample in an
+already materialised bucket is missing from the week, month and year charts; the day chart
+reads raw rows and never lags. The test fixture runs no job scheduler
+(`timescaledb.max_background_workers=0`), so a test materialises only when it calls the job.
 
 **Backups.** You cannot edit a row out of a base backup. The defensible practice is a
 short, published retention (say 30 days), an explicit statement that erasure reaches
