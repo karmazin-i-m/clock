@@ -27,6 +27,7 @@ public class ClockDbContext(DbContextOptions<ClockDbContext> options, ICurrentAc
     public DbSet<DeviceCredential> DeviceCredentials => Set<DeviceCredential>();
     public DbSet<Telemetry> Telemetry => Set<Telemetry>();
     public DbSet<DeviceState> DeviceStates => Set<DeviceState>();
+    public DbSet<DeviceSettings> DeviceSettings => Set<DeviceSettings>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -54,6 +55,11 @@ public class ClockDbContext(DbContextOptions<ClockDbContext> options, ICurrentAc
         modelBuilder.Entity<DeviceCredential>().HasQueryFilter(dc =>
             _accountAccessor.AccountId != null &&
             Set<DeviceAccess>().Any(da => da.BindingId == dc.BindingId
+                && da.AccountId == _accountAccessor.AccountId && da.RevokedAt == null));
+
+        modelBuilder.Entity<DeviceSettings>().HasQueryFilter(ds =>
+            _accountAccessor.AccountId != null &&
+            Set<DeviceAccess>().Any(da => da.BindingId == ds.BindingId
                 && da.AccountId == _accountAccessor.AccountId && da.RevokedAt == null));
 
         modelBuilder.Entity<Device>().HasQueryFilter(d =>

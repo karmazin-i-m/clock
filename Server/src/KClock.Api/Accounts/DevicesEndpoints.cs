@@ -80,7 +80,8 @@ public static class DevicesEndpoints
             db, device.Id, binding.Id, metric, period, EffectiveTimezone(binding), clock.GetUtcNow(), ct)));
     }
 
-    public static async Task<IResult> UpdateAsync(long id, UpdateDeviceRequest request, ClockDbContext db, CancellationToken ct)
+    public static async Task<IResult> UpdateAsync(
+        long id, UpdateDeviceRequest request, ClockDbContext db, TimeProvider clock, CancellationToken ct)
     {
         var displayName = request.DisplayName?.Trim();
         if (displayName is { Length: 0 or > DisplayNameMaxLength })
@@ -106,6 +107,7 @@ public static class DevicesEndpoints
             binding.DisplayName = displayName;
         }
 
+        var timezoneChanged = request.Timezone is not null && request.Timezone != binding.Timezone;
         if (request.Timezone is not null)
         {
             binding.Timezone = request.Timezone;
@@ -119,6 +121,13 @@ public static class DevicesEndpoints
             await db.SaveChangesAsync(ct);
         }
         catch (DbUpdateConcurrencyException)
+        {
+            return Results.StatusCode(StatusCodes.Status403Forbidden);
+        }
+
+        // The zone reaches the clock in the same downlink as the display settings, so a new
+        // zone is a new settings version.
+        if (timezoneChanged && !await SettingsEndpoints.BumpAsync(db, binding.Id, clock, ct))
         {
             return Results.StatusCode(StatusCodes.Status403Forbidden);
         }

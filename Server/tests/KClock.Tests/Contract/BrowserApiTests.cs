@@ -1,27 +1,19 @@
 using System.Net;
 using System.Net.Http.Json;
-using System.Security.Claims;
 using System.Text.Json;
-using KClock.Api.Accounts;
 using KClock.Data;
 using KClock.Data.Entities;
 using KClock.Data.Ingest;
 using KClock.Tests.Fixtures;
-using Microsoft.AspNetCore.Authentication;
-using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace KClock.Tests.Contract;
 
 /// <summary>
-/// The cabinet's reads, end to end through Program.cs, RLS and the security_barrier views. The
-/// session cookie is minted with the cookie handler's own ticket format — the same thing the
-/// Google callback ends in — so everything after sign-in runs unmodified. Requires Docker
-/// (via PostgresFixture).
+/// The cabinet's reads, end to end through Program.cs, RLS and the security_barrier views, as a
+/// signed-in browser (AppFactory.CreateSessionClient). Requires Docker (via PostgresFixture).
 /// </summary>
 [Collection(PostgresCollection.Name)]
 public class BrowserApiTests(PostgresFixture fixture) : IDisposable
@@ -185,18 +177,7 @@ public class BrowserApiTests(PostgresFixture fixture) : IDisposable
         Assert.Equal(JsonValueKind.Null, listed.GetProperty("consumed_device_id").ValueKind);
     }
 
-    private HttpClient CreateClient(Guid accountId)
-    {
-        var options = _factory.Services.GetRequiredService<IOptionsMonitor<CookieAuthenticationOptions>>()
-            .Get(CookieAuthenticationDefaults.AuthenticationScheme);
-        var identity = new ClaimsIdentity([new Claim(AccountClaimTypes.AccountId, accountId.ToString())], "Google");
-        var ticket = new AuthenticationTicket(new ClaimsPrincipal(identity), CookieAuthenticationDefaults.AuthenticationScheme);
-
-        var client = _factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
-        client.DefaultRequestHeaders.Add("Cookie", $"{options.Cookie.Name}={options.TicketDataFormat.Protect(ticket)}");
-        client.DefaultRequestHeaders.Add("X-Requested-With", "test");
-        return client;
-    }
+    private HttpClient CreateClient(Guid accountId) => _factory.CreateSessionClient(accountId);
 
     private async Task<JsonElement> GetJsonAsync(Guid accountId, string path)
     {

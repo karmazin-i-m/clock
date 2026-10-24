@@ -11,4 +11,10 @@ public class DeviceState
     public DateTimeOffset? LastIngestAt { get; set; }
     public long? LastSeq { get; set; }
     public string? FwVersion { get; set; }
+
+    /// <summary>
+    /// The settings version the clock said it holds in its last batch (cfgv, DESIGN.md §5.2) —
+    /// behind DeviceSettings.Version until it has picked a change up.
+    /// </summary>
+    public int? Cfgv { get; set; }
 }

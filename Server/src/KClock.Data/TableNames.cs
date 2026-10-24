@@ -15,4 +15,5 @@ internal static class TableNames
     public const string DeviceCredential = "device_credential";
     public const string Telemetry = "telemetry";
     public const string DeviceState = "device_state";
+    public const string DeviceSettings = "device_settings";
 }

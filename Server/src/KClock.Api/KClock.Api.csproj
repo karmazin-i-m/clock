@@ -18,4 +18,27 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
 
+  <!-- The cabinet SPA (Server/web) ships inside the API's publish output as wwwroot, so the
+       same origin serves both and the session cookie needs no CORS (DESIGN.md §12). npm runs
+       here unless SkipCabinetBuild says the dist is already built (the Dockerfile builds it
+       in a Node stage); the files are picked up either way, and a publish without them fails
+       rather than shipping an API with no cabinet. -->
+  <PropertyGroup>
+    <CabinetRoot>$(MSBuildProjectDirectory)/../../web/</CabinetRoot>
+  </PropertyGroup>
+
+  <Target Name="PublishCabinet" AfterTargets="ComputeFilesToPublish">
+    <Exec Condition="'$(SkipCabinetBuild)' != 'true'" WorkingDirectory="$(CabinetRoot)" Command="npm ci --no-audit --no-fund" />
+    <Exec Condition="'$(SkipCabinetBuild)' != 'true'" WorkingDirectory="$(CabinetRoot)" Command="npm run build" />
+    <Error Condition="!Exists('$(CabinetRoot)dist/index.html')" Text="Server/web/dist is missing: the cabinet was not built." />
+    <ItemGroup>
+      <CabinetDist Include="$(CabinetRoot)dist/**" />
+      <ResolvedFileToPublish Include="@(CabinetDist->'%(FullPath)')" Exclude="@(ResolvedFileToPublish)">
+        <RelativePath>wwwroot/%(RecursiveDir)%(FileName)%(Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
+
 </Project>

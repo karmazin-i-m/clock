@@ -237,11 +237,58 @@ namespace KClock.Data.Migrations
                     b.ToTable("device_credential", (string)null);
                 });
 
+            modelBuilder.Entity("KClock.Data.Entities.DeviceSettings", b =>
+                {
+                    b.Property<long>("BindingId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("binding_id");
+
+                    b.Property<short>("DimFrom")
+                        .HasColumnType("smallint")
+                        .HasColumnName("dim_from");
+
+                    b.Property<short>("DimUntil")
+                        .HasColumnType("smallint")
+                        .HasColumnName("dim_until");
+
+                    b.Property<short>("MarqueeMinutes")
+                        .HasColumnType("smallint")
+                        .HasColumnName("marquee_minutes");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at")
+                        .HasDefaultValueSql("now()");
+
+                    b.Property<int>("Version")
+                        .HasColumnType("integer")
+                        .HasColumnName("version");
+
+                    b.HasKey("BindingId")
+                        .HasName("pk_device_settings");
+
+                    b.ToTable("device_settings", null, t =>
+                        {
+                            t.HasCheckConstraint("ck_device_settings_dim_from", "dim_from BETWEEN 0 AND 24");
+
+                            t.HasCheckConstraint("ck_device_settings_dim_until", "dim_until BETWEEN 0 AND 24");
+
+                            t.HasCheckConstraint("ck_device_settings_marquee_minutes", "marquee_minutes BETWEEN 0 AND 60");
+
+                            t.HasCheckConstraint("ck_device_settings_version", "version > 0");
+                        });
+                });
+
             modelBuilder.Entity("KClock.Data.Entities.DeviceState", b =>
                 {
                     b.Property<long>("DeviceId")
                         .HasColumnType("bigint")
                         .HasColumnName("device_id");
+
+                    b.Property<int?>("Cfgv")
+                        .HasColumnType("integer")
+                        .HasColumnName("cfgv");
 
                     b.Property<string>("FwVersion")
                         .HasColumnType("text")
@@ -453,6 +500,16 @@ namespace KClock.Data.Migrations
                     b.Navigation("Binding");
 
                     b.Navigation("Device");
+                });
+
+            modelBuilder.Entity("KClock.Data.Entities.DeviceSettings", b =>
+                {
+                    b.HasOne("KClock.Data.Entities.DeviceBinding", null)
+                        .WithOne()
+                        .HasForeignKey("KClock.Data.Entities.DeviceSettings", "BindingId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired()
+                        .HasConstraintName("fk_device_settings_device_binding_binding_id");
                 });
 
             modelBuilder.Entity("KClock.Data.Entities.DeviceState", b =>

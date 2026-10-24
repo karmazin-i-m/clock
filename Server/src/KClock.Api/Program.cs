@@ -200,11 +200,14 @@ var apiGroup = app.MapGroup("/api")
 
 apiGroup.MapPost("/auth/signout", (Delegate)GoogleAuthEndpoints.SignOutAsync);
 apiGroup.MapGet("/me", MeEndpoint.HandleAsync);
+apiGroup.MapDelete("/me", MeEndpoint.DeleteAsync);
 apiGroup.MapGet("/devices", DevicesEndpoints.ListAsync);
 apiGroup.MapGet("/devices/{id:long}", DevicesEndpoints.GetAsync);
 apiGroup.MapGet("/devices/{id:long}/summary", DevicesEndpoints.SummaryAsync);
 apiGroup.MapGet("/devices/{id:long}/series", DevicesEndpoints.SeriesAsync);
 apiGroup.MapPatch("/devices/{id:long}", DevicesEndpoints.UpdateAsync);
+apiGroup.MapGet("/devices/{id:long}/settings", SettingsEndpoints.GetAsync);
+apiGroup.MapPut("/devices/{id:long}/settings", SettingsEndpoints.PutAsync);
 apiGroup.MapDelete("/devices/{id:long}/binding", DevicesEndpoints.UnbindAsync);
 apiGroup.MapGet("/history", HistoryEndpoints.ListAsync);
 apiGroup.MapGet("/history/{bindingId:long}", HistoryEndpoints.GetAsync);
@@ -212,6 +215,26 @@ apiGroup.MapGet("/history/{bindingId:long}/series", HistoryEndpoints.SeriesAsync
 apiGroup.MapPost("/enrollment-codes", EnrollmentCodesEndpoints.CreateAsync);
 apiGroup.MapGet("/enrollment-codes", EnrollmentCodesEndpoints.ListAsync);
 apiGroup.MapDelete("/enrollment-codes", EnrollmentCodesEndpoints.DeleteUnconsumedAsync);
+
+// The cabinet SPA (Server/web, published into wwwroot). Every path no endpoint claims gets
+// index.html and the SPA routes it — except under the API's own prefixes, where an unknown
+// path is a 404 and must never come back as a 200 page of HTML that a fetch() would then try
+// to parse. Those literal-prefix fallbacks outrank the catch-all by route precedence.
+// Hashed assets are cached for good; index.html never is, so a deploy is seen on next load.
+var cabinetFiles = new StaticFileOptions
+{
+    OnPrepareResponse = context =>
+        context.Context.Response.Headers.CacheControl = context.File.Name == "index.html"
+            ? "no-cache"
+            : context.Context.Request.Path.StartsWithSegments("/assets") ? "public, max-age=31536000, immutable" : "public, max-age=3600",
+};
+app.UseStaticFiles(cabinetFiles);
+foreach (var prefix in new[] { "/api", "/d", "/auth", "/health" })
+{
+    app.MapFallback($"{prefix}/{{**rest}}", () => Results.NotFound());
+}
+
+app.MapFallbackToFile("index.html", cabinetFiles);
 
 app.Run();
 

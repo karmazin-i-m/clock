@@ -50,4 +50,16 @@ public record TelemetryResponse(
     [property: JsonPropertyName("ok")] bool Ok,
     [property: JsonPropertyName("accepted")] int Accepted,
     [property: JsonPropertyName("dup")] int Dup,
-    [property: JsonPropertyName("policy")] PolicyDto Policy);
+    [property: JsonPropertyName("policy")] PolicyDto Policy,
+    [property: JsonPropertyName("config"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] ConfigDto? Config = null);
+
+// The settings downlink — the first use of the "config" key §5 rule 7 reserved. Sent only when
+// the batch's cfgv differs from the version the cloud holds, so the steady state costs nothing.
+// "cv" rather than "v": "v" is already the policy's version, and two keys may not share a
+// name. "tz" is left out when the zone's rule is unknown or too long for the ESP to store.
+public record ConfigDto(
+    [property: JsonPropertyName("cv")] int Cv,
+    [property: JsonPropertyName("dim_from")] int DimFrom,
+    [property: JsonPropertyName("dim_until")] int DimUntil,
+    [property: JsonPropertyName("marquee_m")] int MarqueeM,
+    [property: JsonPropertyName("tz"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Tz);

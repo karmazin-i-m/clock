@@ -4,3 +4,6 @@
 **/obj/
 .idea/
 .env
+# The cabinet's dependencies and build are made inside the image, for its platform.
+web/node_modules/
+web/dist/

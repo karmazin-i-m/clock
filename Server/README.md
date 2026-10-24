@@ -140,6 +140,31 @@ In Proxmox, start the database container first (`--startup order=1,up=30`, the A
 `order=2`), and firewall port 8080 to the Caddy host: the API trusts `X-Forwarded-*` only
 from `ReverseProxy__TrustedProxies`, but nothing else should be reaching it either.
 
+## The cabinet (Server/web)
+
+The account pages of `design/` as a React + Vite + TypeScript SPA. It needs Node 20 or later.
+
+```bash
+cd Server/web
+npm ci
+npm test            # vitest: LED glyphs, chart gaps, night dimming, Ukrainian plurals
+npm run typecheck
+npm run dev         # http://localhost:5173, proxying /api and /auth to the API on :8080
+```
+
+`npm run dev` expects the API on `localhost:8080` (`KCLOCK_API` overrides it). Sign-in goes
+through Google, so the OAuth client must also list `http://localhost:5173/auth/google/callback`
+for local use — or sign in on the API's own port and reuse the cookie.
+
+`dotnet publish` of `KClock.Api` runs `npm ci && npm run build` and ships `web/dist` as the
+API's `wwwroot`, so `deploy/deploy.sh` now needs Node on the workstation. The Docker image
+builds it in a Node stage instead and publishes with `-p:SkipCabinetBuild=true`. A publish
+without a built cabinet fails rather than shipping an API with no pages.
+
+Not verified in a browser by whoever wrote it: the sandbox had no browser that would start.
+Everything below the pages is covered — `dotnet test` drives the API they call, and vitest the
+drawing code — but the pages themselves want one look in both themes and at phone width.
+
 ## A few judgment calls this implementation made that DESIGN.md doesn't spell out
 
 These are documented in more detail in the doc comments of the files named:

@@ -45,6 +45,10 @@ chart/aggregate API, and OTA firmware distribution.
 The telemetry **response envelope ships in v1** even though it carries almost nothing,
 because a fleet in the field cannot be reflashed to accept a new response shape.
 
+**Since built, ahead of the rest of v2** (for the cabinet in `design/`): the chart API (§12,
+"Browser API"), the configuration downlink (§5.2, "The configuration downlink") and account
+deletion (§10, "As built"). Server-supplied time and OTA distribution remain deferred.
+
 ## 3. Decisions
 
 | Area | Decision |
@@ -143,7 +147,8 @@ appear if the encoding itself changed.
    ArduinoJson can parse with `strstr("\"sample_s\":")` + `atoi` and still be correct. If
    flash runs out, you drop the JSON library, not the cloud feature.
 6. The device **ignores unknown keys**.
-7. Reserved for v2, never emitted in v1: `config`, `time`, `fw`, `token`, `msg`.
+7. Reserved for v2, never emitted in v1: `config`, `time`, `fw`, `token`, `msg`. `config`
+   is now in use (§5.2, "The configuration downlink"); the rest stay reserved.
 
 Minimal API, not controllers, and the reason is concrete: `[ApiController]`'s default 400
 is a ~200 byte RFC 7807 `ProblemDetails` with a `traceId` — five times the size of the
@@ -234,6 +239,38 @@ Encoding choices, each for a reason:
   bytes.
 - **`cfgv`** is the config version the device holds. In v1 it is always `0` on both sides.
   It exists only so v2's config downlink is a pure addition. Cheapest insurance here.
+
+### The configuration downlink
+
+Built for the cabinet's settings page. The browser saves night dimming and the marquee period
+(`PUT /api/devices/{id}/settings`) and the zone (`PATCH /api/devices/{id}`); each change
+takes a new version from the `device_settings_version` sequence and lands in
+`device_settings`, keyed on the **binding**, because these are one owner's choices. A
+telemetry reply whose request `cfgv` differs from that version adds:
+
+```
+"config":{"cv":41,"dim_from":22,"dim_until":7,"marquee_m":5,"tz":"EET-2EEST,M3.5.0/3,M10.5.0/4"}
+```
+
+~110 bytes, so the reply stays well inside 512 (pinned by a test with the widest possible
+values). `cv`, not `v`, because `v` is the policy's (rule 5). `tz` is the POSIX rule the ESP's
+`configTzTime()` takes, read from the footer of the zone's TZif file in the system tzdata —
+any IANA zone works, and the rule is maintained with the zones — and left out when there is no
+rule or it would not fit the ESP's 48 byte field. The values are the firmware's own: two
+boundaries on a 0–24 line (the Nano's `dimmedAt()`), equal meaning never; the marquee 0–60.
+
+Three decisions worth keeping:
+
+- **Versions come from one global sequence.** The clock keeps its `cfgv` across owners, and a
+  per-binding counter would give a new owner's first save the number the previous owner's
+  first save left on the clock — so it would never be sent.
+- **No row, no config.** A binding nobody has saved settings for sends nothing, and the clock
+  keeps what its local page or its defaults set. After the first save the cloud is
+  authoritative (§3) and the local page is the emergency path.
+- **The clock confirms by reporting the version.** `device_state.cfgv` records what each batch
+  says, and the settings page shows "not confirmed yet" until it matches. The ESP takes a
+  version only once it has told the Nano, and drops it again if the Nano's next `<C` disagrees,
+  so a lost frame is resent rather than forgotten.
 
 ### 5.3 Status codes, and what the device must do
 
@@ -705,6 +742,17 @@ binding's buckets while leaving every other device's buckets in the same hours c
 precisely because `binding_id` is in the `GROUP BY`. Then recompress. Neither refresh can
 run inside a transaction block.
 
+**As built.** Phase 1 is `delete_account()`, a `SECURITY DEFINER` function in the
+`AccountDeletion` migration behind `DELETE /api/me`, acting only on `current_account_id()`.
+Phase 2 is `purge_telemetry`, a TimescaleDB job every five minutes rather than code in the API:
+`refresh_continuous_aggregate` cannot run in a transaction block, which a job procedure is not
+in, and the job runs as `clock_migrator`, so the API gains no role that may delete telemetry. It
+refreshes the aggregate per deleted (binding, chunk) slice, but **never within three hours of
+now**: `telemetry_1h` has no refresh policy, so whatever a refresh materialises is never
+revisited, and a late sample from any other clock landing in such a bucket (up to
+`ingest_max_lateness` later) would be lost from every chart. Recent buckets need no refresh
+anyway — nothing materialised them, so they are computed live from the rows just deleted.
+
 **Backups.** You cannot edit a row out of a base backup. The defensible practice is a
 short, published retention (say 30 days), an explicit statement that erasure reaches
 backups by expiry rather than by edit, and a runbook step that re-applies pending erasures
@@ -823,6 +871,12 @@ of an A → B → A owner's periods on the current chart.
 The browser API is snake_case in both directions (`ConfigureHttpJsonOptions`), and an
 unauthenticated `/api/*` call answers 401 rather than redirecting to Google, which a `fetch()`
 cannot follow.
+
+Writes added with it: `GET|PUT /api/devices/{id}/settings` (§5.2, "The configuration
+downlink") and `DELETE /api/me` (§10). The SPA itself (`Server/web`) is published into the
+API's `wwwroot` and served from the same origin, as decided above: any path no endpoint claims
+gets `index.html`, except under `/api`, `/d`, `/auth` and `/health`, where an unknown path is a
+404 and never a page of HTML.
 
 Two modelling points that matter:
 

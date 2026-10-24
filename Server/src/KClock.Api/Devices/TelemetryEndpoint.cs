@@ -1,4 +1,5 @@
 using System.Security.Claims;
+using KClock.Api.Accounts;
 using KClock.Data;
 using KClock.Data.Entities;
 using KClock.Data.Ingest;
@@ -65,22 +66,48 @@ public static class TelemetryEndpoint
         var acceptedCount = await writer.InsertAsync(deviceId, inWindow, ct);
         var dup = request.Samples.Count - acceptedCount;
 
-        await UpsertDeviceStateAsync(db, deviceId, request.Seq, now, ct);
+        await UpsertDeviceStateAsync(db, deviceId, request.Seq, request.Cfgv, now, ct);
 
-        return DeviceResult.Ok(new TelemetryResponse(true, acceptedCount, dup, PolicyResolver.Resolve(device)));
+        var bindingId = long.Parse(user.FindFirstValue(DeviceClaimTypes.BindingId)!);
+        return DeviceResult.Ok(new TelemetryResponse(
+            true, acceptedCount, dup, PolicyResolver.Resolve(device), await PendingConfigAsync(db, bindingId, request.Cfgv, ct)));
     }
 
-    private static async Task UpsertDeviceStateAsync(IngestDbContext db, long deviceId, long seq, DateTimeOffset now, CancellationToken ct)
+    /// <summary>
+    /// The owner's settings, if the clock does not already hold them. Read for the binding the
+    /// credential belongs to — the clock's current owner — never the one a late sample was
+    /// filed under. A binding with no settings row sends nothing, and the clock keeps what it
+    /// runs: that is what an owner who never opened the settings page expects.
+    /// </summary>
+    private static async Task<ConfigDto?> PendingConfigAsync(IngestDbContext db, long bindingId, int cfgv, CancellationToken ct)
+    {
+        var settings = await db.DeviceSettings.AsNoTracking().SingleOrDefaultAsync(s => s.BindingId == bindingId, ct);
+        if (settings is null || settings.Version == cfgv)
+        {
+            return null;
+        }
+
+        var timezone = await db.DeviceBindings.Where(b => b.Id == bindingId).Select(b => b.Timezone).SingleAsync(ct);
+        return new ConfigDto(
+            settings.Version,
+            settings.DimFrom,
+            settings.DimUntil,
+            settings.MarqueeMinutes,
+            PosixTimezone.For(timezone ?? DevicesEndpoints.DefaultTimezone));
+    }
+
+    private static async Task UpsertDeviceStateAsync(IngestDbContext db, long deviceId, long seq, int cfgv, DateTimeOffset now, CancellationToken ct)
     {
         var state = await db.DeviceStates.SingleOrDefaultAsync(s => s.DeviceId == deviceId, ct);
         if (state is null)
         {
-            db.DeviceStates.Add(new DeviceState { DeviceId = deviceId, LastIngestAt = now, LastSeq = seq });
+            db.DeviceStates.Add(new DeviceState { DeviceId = deviceId, LastIngestAt = now, LastSeq = seq, Cfgv = cfgv });
         }
         else
         {
             state.LastIngestAt = now;
             state.LastSeq = seq;
+            state.Cfgv = cfgv;
         }
 
         await db.SaveChangesAsync(ct);

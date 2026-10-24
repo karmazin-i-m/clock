@@ -4,7 +4,8 @@
 #   Server/deploy/deploy.sh [host]     host defaults to $KCLOCK_HOST, then 192.168.23.51
 #
 # Both are self-contained linux-x64 builds, so the host needs neither the SDK nor a .NET
-# runtime - only libicu, which .NET will not start without. The one-time host setup is in
+# runtime - only libicu, which .NET will not start without. The publish also builds the
+# cabinet (Server/web) into the API's wwwroot, so this workstation needs Node and npm. The one-time host setup is in
 # Server/README.md, "Deploying to a plain LXC".
 #
 # Order matters: the migrations run before the new API files land, so a migration that

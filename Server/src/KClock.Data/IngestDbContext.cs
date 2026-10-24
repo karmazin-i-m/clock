@@ -20,6 +20,7 @@ public class IngestDbContext(DbContextOptions<IngestDbContext> options) : DbCont
     public DbSet<DeviceCredential> DeviceCredentials => Set<DeviceCredential>();
     public DbSet<Telemetry> Telemetry => Set<Telemetry>();
     public DbSet<DeviceState> DeviceStates => Set<DeviceState>();
+    public DbSet<DeviceSettings> DeviceSettings => Set<DeviceSettings>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -32,6 +33,7 @@ public class IngestDbContext(DbContextOptions<IngestDbContext> options) : DbCont
         modelBuilder.Entity<DeviceCredential>().ToTable(t => t.ExcludeFromMigrations());
         modelBuilder.Entity<Telemetry>().ToTable(t => t.ExcludeFromMigrations());
         modelBuilder.Entity<DeviceState>().ToTable(t => t.ExcludeFromMigrations());
+        modelBuilder.Entity<DeviceSettings>().ToTable(t => t.ExcludeFromMigrations());
 
         // Not reachable through the device path — exclude entirely so this context never
         // touches account/external_login even by accident.

@@ -1,10 +1,15 @@
+using System.Security.Claims;
+using KClock.Api.Accounts;
 using KClock.Data;
 using KClock.Tests.Fixtures;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Options;
 
 namespace KClock.Tests.Contract;
 
@@ -37,6 +42,24 @@ public sealed class AppFactory(PostgresFixture fixture) : WebApplicationFactory<
             services.AddDbContext<ClockDbContext>(options =>
                 options.UseNpgsql(fixture.AppConnectionString).UseSnakeCaseNamingConvention());
         });
+    }
+
+    /// <summary>
+    /// A browser signed in as <paramref name="accountId"/>. The cookie is minted with the
+    /// cookie handler's own ticket format — what the Google callback ends in — so everything
+    /// after sign-in runs unmodified. Carries the CSRF header every non-GET /api call needs.
+    /// </summary>
+    public HttpClient CreateSessionClient(Guid accountId)
+    {
+        var options = Services.GetRequiredService<IOptionsMonitor<CookieAuthenticationOptions>>()
+            .Get(CookieAuthenticationDefaults.AuthenticationScheme);
+        var identity = new ClaimsIdentity([new Claim(AccountClaimTypes.AccountId, accountId.ToString())], "Google");
+        var ticket = new AuthenticationTicket(new ClaimsPrincipal(identity), CookieAuthenticationDefaults.AuthenticationScheme);
+
+        var client = CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+        client.DefaultRequestHeaders.Add("Cookie", $"{options.Cookie.Name}={options.TicketDataFormat.Protect(ticket)}");
+        client.DefaultRequestHeaders.Add("X-Requested-With", "test");
+        return client;
     }
 
     protected override void Dispose(bool disposing)

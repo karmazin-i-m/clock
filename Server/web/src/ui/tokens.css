@@ -1,0 +1,106 @@
+/* Design tokens, HANDOFF §3. Dark is the primary theme; light is complete, not an afterthought.
+   data-theme on <html> is always the theme actually shown: index.html sets it before first
+   paint, and theme.ts keeps it in step with the profile choice and, for "system", with the
+   OS. The LED well and plate stay dark in both themes: it is a picture of the panel. */
+
+:root {
+  color-scheme: dark;
+  --bg: #121314;
+  --surface: #1a1c1e;
+  --surface-2: #17181a;
+  --raised: #26292d;
+  --segment: #1e2023;
+  --segment-on: #2e3135;
+  --line: #2e3135;
+  --divider: #22252a;
+  --field-line: #3a3e43;
+  --grid: #2a2d31;
+  --text: #ede9e3;
+  --text-soft: #cfcac2;
+  --muted: #a29d95;
+  --faint: #6f6b66;
+  --well: #0d0e0f;
+  --plate: #0a0a0b;
+  --input-bg: #121314;
+
+  --accent: #ffa630;
+  --accent-text: #ffa630;
+  --on-accent: #1a1206;
+  --primary-bg: #ffa630;
+  --primary-fg: #1a1206;
+  --accent-ring: rgba(255, 166, 48, 0.2);
+  --accent-fill-top: rgba(255, 166, 48, 0.22);
+
+  --online-dot: #5fd39a;
+  --online-fg: #86e3b4;
+  --online-bg: rgba(95, 211, 154, 0.14);
+  --offline-dot: #77726b;
+  --offline-fg: #b5b0a8;
+  --offline-bg: rgba(255, 255, 255, 0.07);
+  --readonly-dot: #ffa630;
+  --readonly-fg: #ffc271;
+  --readonly-bg: rgba(255, 166, 48, 0.12);
+  --note-bg: rgba(255, 166, 48, 0.08);
+  --note-line: #4a3818;
+  --note-fg: #e9d2b0;
+  --danger: #ff6b5b;
+  --danger-fg: #ff9a8e;
+  --danger-line: #5a2a24;
+  --danger-bg: rgba(255, 107, 91, 0.05);
+  --danger-solid-fg: #1a0806;
+  --gap-fill: rgba(255, 255, 255, 0.035);
+
+  --led: #ffa630;
+  --led-off: #57534d;
+  --led-glow: rgba(255, 166, 48, 0.67);
+  --led-halo: rgba(255, 166, 48, 0.27);
+  --led-glow-night: rgba(255, 166, 48, 0.33);
+  --led-halo-night: rgba(255, 166, 48, 0.09);
+
+  --font-ui: 'Onest', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #f4f2ee;
+  --surface: #ffffff;
+  --surface-2: #faf8f5;
+  --raised: #efebe5;
+  --segment: #f0ede8;
+  --segment-on: #ffffff;
+  --line: #e2ded7;
+  --divider: #e2ded7;
+  --field-line: #c9c4bc;
+  --grid: #e2ded7;
+  --text: #1b1c1e;
+  --text-soft: #3d3a36;
+  --muted: #5e5a54;
+  --faint: #8d877f;
+  --well: #1b1c1e;
+  --input-bg: #ffffff;
+  --accent: #c46c00;
+  --accent-text: #a65a00;
+  --primary-bg: #1b1c1e;
+  --primary-fg: #ffffff;
+  --accent-ring: rgba(196, 108, 0, 0.18);
+  --accent-fill-top: rgba(196, 108, 0, 0.22);
+  --online-dot: #2e9a63;
+  --online-fg: #1f6b45;
+  --online-bg: #e3f4ea;
+  --offline-dot: #8d877f;
+  --offline-fg: #5e5a54;
+  --offline-bg: #ece9e4;
+  --readonly-dot: #c46c00;
+  --readonly-fg: #8a4b00;
+  --readonly-bg: #fbeedc;
+  --note-bg: #fbf1e3;
+  --note-line: #ecd3ae;
+  --note-fg: #5c3a0b;
+  --danger: #c4372a;
+  --danger-fg: #a52b20;
+  --danger-line: #efc4be;
+  --danger-bg: #fdf3f2;
+  --danger-solid-fg: #ffffff;
+  --gap-fill: rgba(27, 28, 30, 0.04);
+}
