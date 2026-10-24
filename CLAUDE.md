@@ -14,6 +14,8 @@ The repo is not only firmware — it also holds the mechanical and electrical de
 |---|---|
 | `Clock_Arduino/` | Clock firmware as an Arduino sketch. **This is the canonical source.** |
 | `Clock_ESP01/` | ESP-01 firmware: captive portal, NTP, settings page |
+| `Server/` | K-Clock Cloud: the .NET API (`src/`), the cabinet SPA (`web/`), deploy scripts — see `Server/README.md` and `Server/DESIGN.md` |
+| `design/` | Mock-ups and `HANDOFF.md` the cabinet is built from |
 | `Clock/Arduino Nano 3/` | Proteus (`.pdsprj`) simulation of the circuit |
 | `Gerber files/` | Fabrication zips for three boards: Control, Display, ESP01 template |
 | `Autocad_Model/` | AutoCAD drawings of the enclosure and the GNM-23881 display module |
@@ -405,7 +407,7 @@ redirects to therefore waits out the ~4 s handshake and shows the result. There 
 the code is single use and lives fifteen minutes, so a refused one is spent anyway.
 `cloudPost()` is the one HTTPS call, a fresh connection per request with `Connection: close`,
 and the replies are read with `strstr` rather than a JSON library, which contract rule 5
-(every key unique as a substring) exists to allow. The token lives in EEPROM layout `KCL3`,
+(every key unique as a substring) exists to allow. The token arrived with EEPROM layout `KCL3`,
 which only appended it, so a `KCL2` module keeps its other settings and starts unbound. It is
 replaced only by a successful enrollment and never cleared because the server refused it —
 the 401 rule in §5.3 — and it never appears on a page; the status page says only whether one is
@@ -425,6 +427,22 @@ the token**, 413 retries once at half size, 429 honours `Retry-After`, anything 
 samples and backs off 1, 2, 5, 10, 15 minutes. A full ring overwrites its oldest sample and
 counts it, and the status page shows that count with the queue and the last send.
 `seq` restarts at 1 on boot, on purpose, so the server can see the restart.
+
+**The cabinet's display settings come back in the telemetry reply** (Server/DESIGN.md §5.2,
+"config"). Every batch carries `cfgv`, the version of the cloud's settings the module last
+applied, kept in EEPROM layout `KCL4` — which, like `KCL3`, only appended a field, so a `KCL3`
+module keeps everything and starts from 0. While that differs from the server's version, the
+200 carries `config` with `cv`, `dim_from`, `dim_until`, `marquee_m` and usually `tz`, and
+`applyCloudConfig()` sends the three values to the Nano as the same `>C` frames the settings
+page sends (`sendConfigValue()`), puts the zone into `configTzTime`, and stores `cv`. It takes
+the version only when the link is alive and not quiet: otherwise the frames would go nowhere,
+and keeping the old version has the server send the lot again with the next batch. The Nano
+never acknowledges a `>C` by itself, so its next `<C` is compared with what was sent, and a
+mismatch forgets the version for the same effect. Versions come from one global server
+sequence, never a per-owner counter, because the module keeps its `cfgv` across owners. The
+cloud is authoritative once it has sent something; until then the module runs whatever its
+local page or the firmware defaults set. With this the image is 497552 bytes, 592 more than
+before, leaving ~14 KB under the OTA ceiling.
 
 **The request and reply share one static 1 KB buffer**, `cloudBuffer`, which `cloudPost()` can
 do because it has written the whole request before it reads a byte. Both used to be locals,

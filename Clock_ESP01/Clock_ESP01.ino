@@ -113,8 +113,11 @@ static const char DefaultOtaPassword[] = "k-clock";
 // Bumped when the struct grows, so a module carrying the older layout falls
 // back to the defaults instead of reading the new field out of stale bytes.
 // KCL3 only appended the token, so a KCL2 module keeps its time zone and OTA
-// password - they sit at the same offsets - and starts out unbound.
-static const uint32_t SettingsMagic = 0x4B434C33;    // "KCL3"
+// password - they sit at the same offsets - and starts out unbound. KCL4 only
+// appended cfgv in the same way, so a KCL3 module keeps its binding too and
+// starts from version 0, which the server answers with its settings.
+static const uint32_t SettingsMagic = 0x4B434C34;      // "KCL4"
+static const uint32_t SettingsMagicKcl3 = 0x4B434C33;  // "KCL3"
 static const uint32_t SettingsMagicKcl2 = 0x4B434C32;  // "KCL2"
 
 struct EspSettings {
@@ -126,6 +129,11 @@ struct EspSettings {
   // enrollment - never cleared because the server refused it, or one bad
   // deploy answering 401 would unbind every clock for good (DESIGN.md §5.3).
   char token[64];
+  // The version of the cloud's display settings this clock last applied
+  // (Server/DESIGN.md §5.2, "cfgv"). 0 until the cloud has sent any. Kept
+  // across owners on purpose: the server numbers versions from one global
+  // sequence, so a new owner's first change never looks like one already held.
+  uint32_t cfgv;
 };
 
 EspSettings settings;
@@ -171,6 +179,11 @@ struct ClockConfig {
 
 ClockConfig clockConfig;
 
+// The display settings the cloud last sent, until the clock's own <C confirms
+// them (handleConfigFrame).
+ClockConfig cloudConfig;
+bool cloudConfigPending;
+
 unsigned long linkFramesGood;
 unsigned long linkFramesDropped;
 unsigned long linkFramesRejected;
@@ -191,6 +204,10 @@ void loadSettings() {
     // The bytes behind the old layout are whatever the sector held before.
     settings.magic = SettingsMagic;
     memset(settings.token, 0, sizeof(settings.token));
+    settings.cfgv = 0;
+  } else if (settings.magic == SettingsMagicKcl3) {
+    settings.magic = SettingsMagic;
+    settings.cfgv = 0;
   } else if (settings.magic != SettingsMagic) {
     settings.magic = SettingsMagic;
     strncpy(settings.tz, DefaultTz, sizeof(settings.tz) - 1);
@@ -198,6 +215,7 @@ void loadSettings() {
     strncpy(settings.otaPassword, DefaultOtaPassword,
             sizeof(settings.otaPassword) - 1);
     memset(settings.token, 0, sizeof(settings.token));
+    settings.cfgv = 0;
   }
 
   // Outside the branch on purpose. A half written commit can leave the magic
@@ -320,6 +338,17 @@ void handleConfigFrame(char *args) {
   clockConfig.dimUntil = until;
   clockConfig.marquee = marquee;
   clockConfig.valid = true;
+
+  // The clock never acknowledges a >C on its own; its next <C is the answer.
+  // If it is not what the cloud asked for, a frame was lost on the wire, and
+  // forgetting the version makes the server send the settings again.
+  if (cloudConfigPending) {
+    cloudConfigPending = false;
+    if (from != cloudConfig.dimFrom || until != cloudConfig.dimUntil || marquee != cloudConfig.marquee) {
+      settings.cfgv = 0;
+      saveSettings();
+    }
+  }
 }
 
 void handleLinkFrame(char *line) {
@@ -514,7 +543,7 @@ static const unsigned long CloudReadMs = 5000;
 // What the server builds this device's policy from, and the version it records
 // on enrollment - the only moment it learns one, so bump it with a release.
 static const char DeviceProfile[] = "esp8266-1m";
-static const char FwVersion[] = "2026.10.21";
+static const char FwVersion[] = "2026.10.24";
 
 // Roots rather than the leaf or YE1, which Let's Encrypt reissues - a pin on
 // either would blind the clock within ninety days. Two of them, because Caddy
@@ -758,6 +787,61 @@ static void applyPolicy(const char *json) {
   }
 }
 
+// Spaced out on purpose: three frames back to back are around sixty bytes,
+// which is the whole of the Nano's hardware receive buffer, and it only drains
+// between passes of its loop().
+static void sendConfigValue(const char *key, long number) {
+  char frame[32];
+  snprintf(frame, sizeof(frame), ">C %s %ld", key, number);
+  linkSend(frame);
+  delay(50);
+}
+
+// The settings downlink (Server/DESIGN.md §5.2). The server sends "config" only
+// while the cfgv in our batches differs from its own version, so this runs once
+// per change. The values go to the Nano exactly as the settings page sends
+// them, and the zone straight into our own NTP setup. The version is taken
+// only when the clock can be told at all: with the link down or quiet the
+// frames would go nowhere, and keeping the old version has the server send the
+// settings again with the next batch. A value out of range means the server is
+// wrong, and the whole config is ignored rather than half applied.
+static void applyCloudConfig(const char *json) {
+  if (strstr(json, "\"config\":{") == NULL) {
+    return;
+  }
+
+  long cv, from, until, marquee;
+  if (!jsonInt(json, "cv", &cv) || cv <= 0 ||
+      !jsonInt(json, "dim_from", &from) || from < 0 || from > 24 ||
+      !jsonInt(json, "dim_until", &until) || until < 0 || until > 24 ||
+      !jsonInt(json, "marquee_m", &marquee) || marquee < 0 || marquee > 60) {
+    return;
+  }
+
+  if (!linkAlive() || linkQuiet()) {
+    return;
+  }
+
+  sendConfigValue("dimfrom", from);
+  sendConfigValue("dimuntil", until);
+  sendConfigValue("marquee", marquee);
+  cloudConfig.dimFrom = from;
+  cloudConfig.dimUntil = until;
+  cloudConfig.marquee = marquee;
+  cloudConfigPending = true;
+  clockConfig.valid = false;
+  configPollTime = millis() - ConfigPollMs;
+
+  char tz[sizeof(settings.tz)];
+  if (jsonString(json, "tz", tz, sizeof(tz)) && tz[0] != '\0' && strcmp(tz, settings.tz) != 0) {
+    strcpy(settings.tz, tz);
+    startTimeSync();
+  }
+
+  settings.cfgv = cv;
+  saveSettings();
+}
+
 // No retry on failure: the code is single use and lives fifteen minutes, so a
 // refused one is spent and a fresh one has to come from the account anyway.
 void cloudEnroll() {
@@ -848,8 +932,8 @@ void cloudFlush() {
   // The widest sample is 49 characters and a comma.
   static_assert(40 + MaxBatchCap * 50 <= sizeof(cloudBuffer), "a full batch must fit");
   char *json = cloudBuffer;
-  int length = snprintf(json, sizeof(cloudBuffer), "{\"seq\":%lu,\"cfgv\":0,\"samples\":[",
-                        (unsigned long)batchSeq);
+  int length = snprintf(json, sizeof(cloudBuffer), "{\"seq\":%lu,\"cfgv\":%lu,\"samples\":[",
+                        (unsigned long)batchSeq, (unsigned long)settings.cfgv);
   for (uint8_t i = 0; i < count; i++) {
     const Sample &s = ring[(ringHead + i) % RingCapacity];
     length += snprintf(json + length, sizeof(cloudBuffer) - length,
@@ -871,6 +955,7 @@ void cloudFlush() {
       backoffStep = 0;
       flushOkAt = flushStart;
       applyPolicy(body);
+      applyCloudConfig(body);
       flushWaitMs = ringCount - count >= maxBatch ? BacklogFlushMs : flushMs;
       break;
 
@@ -1050,6 +1135,10 @@ void handleRoot() {
     appendRow(page, F("Відправка"), cloudSendState());
     appendRow(page, F("У черзі / втрачено"),
               String(ringCount) + F(" / ") + ringLost + F(" вимірів"));
+    // Which of the cabinet's saves this clock runs. 0 means it has never been
+    // sent any, and whatever was set on this page or by default still holds.
+    appendRow(page, F("Налаштування з кабінету"),
+              settings.cfgv ? String(F("версія ")) + settings.cfgv : String(F("ще не надходили")));
   }
 
   appendRow(page, F("Пам'ять (вільно / блок)"), heapSummary());
@@ -1174,10 +1263,7 @@ static void sendConfig(const char *key, long low, long high) {
     return;
   }
 
-  char frame[32];
-  snprintf(frame, sizeof(frame), ">C %s %ld", key, number);
-  linkSend(frame);
-  delay(50);
+  sendConfigValue(key, number);
 }
 
 // Exactly "2026-09-21 14:03:22" and nothing else. Strict because the Nano's
@@ -1254,12 +1340,10 @@ void handleSave() {
     }
   }
 
-  // Spaced out on purpose - each sendConfig ends in a short delay. Three frames
-  // back to back are around sixty bytes, which is the whole of the Nano's
-  // hardware receive buffer, and it only drains between passes of loop().
-  // Both ends go to 24, not 23. They are boundaries on a 0..24 line rather than
-  // hours of the day - dimmedAt() treats the end as half open - and 24 is what
-  // makes "dim around the clock" expressible at all.
+  // Each sendConfig ends in a short delay; see sendConfigValue. Both ends go
+  // to 24, not 23. They are boundaries on a 0..24 line rather than hours of
+  // the day - dimmedAt() treats the end as half open - and 24 is what makes
+  // "dim around the clock" expressible at all.
   sendConfig("dimfrom", 0, 24);
   sendConfig("dimuntil", 0, 24);
   sendConfig("marquee", 0, 60);
